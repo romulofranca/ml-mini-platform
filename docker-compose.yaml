@@ -1,0 +1,32 @@
+services:
+  minio:
+    image: minio/minio
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+
+  app:
+    build: .
+    container_name: ml_api
+    ports:
+      - "8000:8000"
+    depends_on:
+      - minio
+    environment:
+      MINIO_ENDPOINT: "http://minio:9000"
+      MINIO_ACCESS_KEY: "minioadmin"
+      MINIO_SECRET_KEY: "minioadmin"
+      DATASETS_BUCKET: "datasets"
+      TRAINED_MODELS_BUCKET: "trained-models"
+      MODEL_FILE_NAME: "model.pkl"
+    command: ["poetry", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+volumes:
+  minio_data:
