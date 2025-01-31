@@ -1,30 +1,30 @@
-import os
-import logging
-import pickle
+import io
 import json
-import uuid
+import logging
+import os
+import pickle
 import traceback
+import uuid
 from datetime import datetime
+from importlib import import_module
 from typing import List, Optional
+
+import boto3
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Body
-from pydantic import BaseModel
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report, mean_squared_error
-from sklearn import datasets
-from sklearn.base import ClassifierMixin
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from sklearn.impute import SimpleImputer
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from importlib import import_module
 import uvicorn
-import boto3
 from botocore.client import Config
+from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
-import io
+from pydantic import BaseModel
+from sklearn import datasets
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import classification_report, f1_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -60,17 +60,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pydantic models for request validation
 class TrainRequest(BaseModel):
     dataset_path: Optional[str] = None
     use_example: bool = False
     model: dict
+    target_column: Optional[str] = None
 
 class InputData(BaseModel):
     features: List[List[float]]
 
+def detect_target_column(df):
+    possible_target_columns = ["target", "label", "class", "y"]
+    for col in possible_target_columns:
+        if col in df.columns:
+            return col
+    return df.columns[-1]
+
 def preprocess_data(df):
-    """Preprocess the dataset by handling missing values, scaling, and encoding."""
     numeric_features = df.select_dtypes(include=['int64', 'float64']).columns
     categorical_features = df.select_dtypes(include=['object', 'category']).columns
 
@@ -95,12 +101,10 @@ def preprocess_data(df):
 
 @app.get("/", summary="Check API status", tags=["General"])
 def home():
-    """Check if the API is running."""
     return {"message": "ML Mini Platform is running!"}
 
 @app.post("/upload", summary="Upload dataset", tags=["Dataset"])
 def upload_file(file: UploadFile = File(...)):
-    """Upload a dataset to MinIO."""
     try:
         s3_client.put_object(Bucket=DATASETS_BUCKET, Key=file.filename, Body=file.file.read())
         return {"message": f"File {file.filename} uploaded successfully!"}
@@ -110,7 +114,6 @@ def upload_file(file: UploadFile = File(...)):
 
 @app.get("/list-datasets", summary="List available datasets", tags=["Dataset"])
 def list_datasets():
-    """List all available datasets in MinIO."""
     try:
         response = s3_client.list_objects_v2(Bucket=DATASETS_BUCKET)
         datasets = [obj["Key"] for obj in response.get("Contents", [])]
@@ -121,7 +124,6 @@ def list_datasets():
 
 @app.get("/list-models", summary="List trained models", tags=["Model"])
 def list_models():
-    """List all trained models in MinIO."""
     try:
         response = s3_client.list_objects_v2(Bucket=TRAINED_MODELS_BUCKET)
         models = [obj["Key"] for obj in response.get("Contents", [])]
@@ -170,7 +172,6 @@ def train_model(
     background_tasks: BackgroundTasks,
     request: TrainRequest = Body(...),
 ):
-    """Train a model using a dataset from MinIO or an example dataset."""
     try:
         if request.use_example:
             iris = datasets.load_iris()
@@ -188,18 +189,22 @@ def train_model(
                 logger.error(f"Failed to load dataset: {e}")
                 raise HTTPException(status_code=404, detail="Dataset not found")
 
-        if df.iloc[:, -1].isnull().any():
-            logger.warning("Target column contains NaN values. Removing rows with missing values.")
-            df = df.dropna(subset=[df.columns[-1]])
+        if request.target_column:
+            target_column = request.target_column
+        else:
+            target_column = detect_target_column(df)
+            logger.info(f"Target column detected automatically: {target_column}")
 
-        if df.empty:
-            raise HTTPException(status_code=400, detail="The dataset is empty after removing NaN values.")
+        if target_column not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Target column '{target_column}' not found in dataset.")
 
-        X = preprocess_data(df.iloc[:, :-1])
-        y = df.iloc[:, -1]
+        X = df.drop(columns=[target_column])
+        y = df[target_column]
 
-        if y.isnull().any():
-            raise HTTPException(status_code=400, detail="Target column still contains NaN values after preprocessing.")
+        num_classes = len(y.unique())
+        logger.info(f"Number of classes in the dataset: {num_classes}")
+
+        X = preprocess_data(X)
 
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
@@ -212,12 +217,10 @@ def train_model(
             raise HTTPException(status_code=400, detail="Invalid model configuration")
 
         model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
 
-        if isinstance(model, ClassifierMixin):
-            metrics = classification_report(y_test, y_pred, output_dict=True)
-        else:
-            metrics = {"mse": mean_squared_error(y_test, y_pred)}
+        y_pred = model.predict(X_test)
+        metrics = classification_report(y_test, y_pred, output_dict=True)
+        metrics["f1_score"] = f1_score(y_test, y_pred, average="weighted")
 
         model_version = str(uuid.uuid4())
         model_dir = f"{dataset_path}/version-{model_version}"
@@ -247,7 +250,6 @@ def train_model(
 
 @app.post("/predict", summary="Make predictions using a trained model", tags=["Model"])
 def predict(model_path: str, input_data: InputData):
-    """Make predictions using a trained model."""
     try:
         if not input_data.features:
             raise HTTPException(status_code=400, detail="No input data provided.")
@@ -262,11 +264,9 @@ def predict(model_path: str, input_data: InputData):
 
 @app.get("/openapi.json", summary="Get OpenAPI schema", tags=["General"])
 def get_openapi_schema():
-    """Return the OpenAPI schema."""
     return get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
 
 def monitor_model_performance(model_path: str):
-    """Monitor model performance and trigger retraining if necessary."""
     pass
 
 if __name__ == "__main__":
