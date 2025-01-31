@@ -26,18 +26,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 import io
 
-# Logging configuration
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Environment variables
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
 DATASETS_BUCKET = os.getenv("DATASETS_BUCKET")
 TRAINED_MODELS_BUCKET = os.getenv("TRAINED_MODELS_BUCKET")
 
-# S3 client configuration
 s3_client = boto3.client(
     "s3",
     endpoint_url=MINIO_ENDPOINT,
@@ -46,7 +43,6 @@ s3_client = boto3.client(
     config=Config(signature_version="s3v4"),
 )
 
-# FastAPI app configuration
 app = FastAPI(
     title="ML Mini Platform",
     description="A platform for training and serving ML models",
@@ -56,7 +52,6 @@ app = FastAPI(
     openapi_url="/openapi.json"
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -65,7 +60,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pydantic models
+# Pydantic models for request validation
 class TrainRequest(BaseModel):
     dataset_path: Optional[str] = None
     use_example: bool = False
@@ -74,7 +69,6 @@ class TrainRequest(BaseModel):
 class InputData(BaseModel):
     features: List[List[float]]
 
-# Helper functions
 def preprocess_data(df):
     """Preprocess the dataset by handling missing values, scaling, and encoding."""
     numeric_features = df.select_dtypes(include=['int64', 'float64']).columns
@@ -96,9 +90,9 @@ def preprocess_data(df):
             ('cat', categorical_transformer, categorical_features)
         ])
 
+    logger.info("Preprocessing completed successfully.")
     return preprocessor.fit_transform(df)
 
-# API endpoints
 @app.get("/", summary="Check API status", tags=["General"])
 def home():
     """Check if the API is running."""
@@ -152,7 +146,7 @@ def list_models():
                             "value": {
                                 "message": "Model trained successfully",
                                 "accuracy": 0.95,
-                                "model_path": "iris/version-1/model.pkl"
+                                "model_path": "iris-sample/version-1/model.pkl"
                             }
                         },
                         "example2": {
@@ -174,20 +168,7 @@ def list_models():
 )
 def train_model(
     background_tasks: BackgroundTasks,
-    request: TrainRequest = Body(
-        ...,
-        example={
-            "use_example": True,
-            "model": {
-                "module": "ensemble",
-                "class": "RandomForestClassifier",
-                "params": {
-                    "n_estimators": 100,
-                    "max_depth": 5,
-                },
-            },
-        },
-    ),
+    request: TrainRequest = Body(...),
 ):
     """Train a model using a dataset from MinIO or an example dataset."""
     try:
@@ -195,22 +176,33 @@ def train_model(
             iris = datasets.load_iris()
             df = pd.DataFrame(data=iris.data, columns=iris.feature_names)
             df["target"] = iris.target
+            dataset_path = "iris-sample"
         else:
             if not request.dataset_path:
                 raise HTTPException(status_code=400, detail="Dataset path is required")
             try:
                 response = s3_client.get_object(Bucket=DATASETS_BUCKET, Key=request.dataset_path)
                 df = pd.read_csv(io.BytesIO(response["Body"].read()))
+                dataset_path = request.dataset_path
             except Exception as e:
                 logger.error(f"Failed to load dataset: {e}")
                 raise HTTPException(status_code=404, detail="Dataset not found")
 
-        # Preprocess data
+        if df.iloc[:, -1].isnull().any():
+            logger.warning("Target column contains NaN values. Removing rows with missing values.")
+            df = df.dropna(subset=[df.columns[-1]])
+
+        if df.empty:
+            raise HTTPException(status_code=400, detail="The dataset is empty after removing NaN values.")
+
         X = preprocess_data(df.iloc[:, :-1])
         y = df.iloc[:, -1]
+
+        if y.isnull().any():
+            raise HTTPException(status_code=400, detail="Target column still contains NaN values after preprocessing.")
+
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-        # Load and train the model
         try:
             module = import_module("sklearn." + request.model["module"])
             ModelClass = getattr(module, request.model["class"])
@@ -222,15 +214,13 @@ def train_model(
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
 
-        # Calculate metrics
         if isinstance(model, ClassifierMixin):
             metrics = classification_report(y_test, y_pred, output_dict=True)
         else:
             metrics = {"mse": mean_squared_error(y_test, y_pred)}
 
-        # Save the model and metadata
         model_version = str(uuid.uuid4())
-        model_dir = f"{request.dataset_path}/version-{model_version}"
+        model_dir = f"{dataset_path}/version-{model_version}"
         model_file_path = f"{model_dir}/model.pkl"
         metadata = {
             "version": model_version,
@@ -245,7 +235,6 @@ def train_model(
         s3_client.put_object(Bucket=TRAINED_MODELS_BUCKET, Key=model_file_path, Body=model_data.getvalue())
         s3_client.put_object(Bucket=TRAINED_MODELS_BUCKET, Key=f"{model_dir}/metadata.json", Body=json.dumps(metadata))
 
-        # Add monitoring task
         background_tasks.add_task(monitor_model_performance, model_file_path)
 
         return {"message": "Model trained successfully", "metrics": metrics, "model_path": model_file_path}
@@ -260,6 +249,9 @@ def train_model(
 def predict(model_path: str, input_data: InputData):
     """Make predictions using a trained model."""
     try:
+        if not input_data.features:
+            raise HTTPException(status_code=400, detail="No input data provided.")
+
         response = s3_client.get_object(Bucket=TRAINED_MODELS_BUCKET, Key=model_path)
         model = pickle.loads(response["Body"].read())
         predictions = model.predict(np.array(input_data.features))
@@ -273,12 +265,9 @@ def get_openapi_schema():
     """Return the OpenAPI schema."""
     return get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
 
-# Background task for monitoring model performance
 def monitor_model_performance(model_path: str):
     """Monitor model performance and trigger retraining if necessary."""
-    # Implement monitoring logic here
     pass
 
-# Run the application
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
