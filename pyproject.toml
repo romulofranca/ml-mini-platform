@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "ml-mini-platform"
+version = "0.1.0"
+description = "A platform for training and serving ML models"
+authors = ["Rômulo Franca <71389109+romulofranca@users.noreply.github.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.13"
+fastapi = "^0.115.8"
+numpy = "^2.2.2"
+pandas = "^2.2.3"
+pydantic = "^2.10.6"
+boto3 = "^1.36.10"
+uvicorn = "^0.34.0"
+scikit-learn = "^1.6.1"
+python-multipart = "^0.0.20"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
