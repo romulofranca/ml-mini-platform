@@ -1,6 +1,6 @@
 from typing import List, Optional, Dict
 from datetime import datetime
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, ConfigDict
 
 
 class TrainRequest(BaseModel):
@@ -31,6 +31,4 @@ class DatasetResponse(BaseModel):
     location: str
     created_at: datetime
 
-    model_config = {
-        "orm_mode": True
-    }
+    model_config = ConfigDict(from_attributes=True)
