@@ -9,9 +9,6 @@ logger = logging.getLogger(__name__)
 
 
 def detect_target_column(df: pd.DataFrame) -> str:
-    """
-    Detect the target column from a DataFrame using possible names.
-    """
     possible_target_columns = ["target", "label", "class", "y"]
     for col in possible_target_columns:
         if col in df.columns:
@@ -19,10 +16,7 @@ def detect_target_column(df: pd.DataFrame) -> str:
     return df.columns[-1]
 
 
-def create_preprocessor(df: pd.DataFrame) -> ColumnTransformer:
-    """
-    Create a preprocessor for numeric and categorical columns.
-    """
+def create_preprocessor(df: pd.DataFrame):
     numeric_features = df.select_dtypes(
         include=["int64", "float64"]
     ).columns.tolist()

@@ -1,23 +1,22 @@
 import logging
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-
 from app.routes import dataset, model
 from app.middleware.error_handler import (
     http_exception_handler,
     generic_exception_handler,
 )
+from app.db import models, session
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="ML Mini Platform",
-    description="A platform for training and serving ML models",
+    title="ML Mini Platform with SQLite Model Registry",
+    description="A platform for cataloging datasets, training models, promoting them, and serving predictions",
     version="0.1.0",
 )
 
-# CORS configuration – in production, restrict allowed origins as needed
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,18 +25,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register routers
 app.include_router(dataset.router)
 app.include_router(model.router)
 
-# Setup exception handlers
 app.add_exception_handler(Exception, generic_exception_handler)
 app.add_exception_handler(HTTPException, http_exception_handler)
 
 
-@app.get("/", summary="Check API status", tags=["General"])
+@app.get("/", summary="Check API status")
 def home():
     return {"message": "ML Mini Platform is running!"}
+
+
+@app.on_event("startup")
+def on_startup():
+    models.Base.metadata.create_all(bind=session.engine)
+    logger.info("Database tables created.")
 
 
 if __name__ == "__main__":

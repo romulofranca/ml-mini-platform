@@ -1,21 +1,19 @@
 import io
 import logging
-
 import boto3
 from botocore.client import Config
 from fastapi import HTTPException
 import pandas as pd
-
 from app.config import (
     OBJECT_STORAGE_ENDPOINT,
     OBJECT_STORAGE_ACCESS_KEY,
     OBJECT_STORAGE_SECRET_KEY,
     DATASETS_BUCKET,
+    TRAINED_MODELS_BUCKET,
 )
 
 logger = logging.getLogger(__name__)
 
-# Initialize the Object Storage client (e.g., MinIO, S3)
 object_storage_client = boto3.client(
     "s3",
     endpoint_url=OBJECT_STORAGE_ENDPOINT,
@@ -25,51 +23,18 @@ object_storage_client = boto3.client(
 )
 
 
-def load_dataset_from_storage(dataset_path: str) -> pd.DataFrame:
-    """
-    Load a dataset from object storage given its path.
-    """
+def load_dataset_from_storage(dataset_key: str) -> pd.DataFrame:
     try:
         response = object_storage_client.get_object(
-            Bucket=DATASETS_BUCKET, Key=dataset_path
+            Bucket=DATASETS_BUCKET, Key=dataset_key
         )
         df = pd.read_csv(io.BytesIO(response["Body"].read()))
-        logger.info(f"Dataset '{dataset_path}' loaded successfully.")
+        logger.info(
+            f"Dataset '{dataset_key}' loaded successfully from storage."
+        )
         return df
     except Exception as e:
-        logger.exception(f"Failed to load dataset '{dataset_path}': {e}")
-        raise HTTPException(status_code=404, detail="Dataset not found")
-
-
-def upload_file_to_storage(file_content: bytes, filename: str, bucket: str):
-    """
-    Upload a file to the specified bucket in object storage.
-    """
-    try:
-        object_storage_client.put_object(
-            Bucket=bucket, Key=filename, Body=file_content
+        logger.exception(f"Failed to load dataset '{dataset_key}': {e}")
+        raise HTTPException(
+            status_code=404, detail="Dataset not found in storage"
         )
-        logger.info(
-            f"File '{filename}' uploaded successfully to bucket '{bucket}'."
-        )
-    except Exception as e:
-        logger.exception(f"Failed to upload file: {e}")
-        raise HTTPException(status_code=500, detail="Failed to upload file")
-
-
-def list_objects(bucket: str):
-    """
-    List objects in the specified bucket.
-    """
-    try:
-        response = object_storage_client.list_objects_v2(Bucket=bucket)
-        objects_list = (
-            [obj["Key"] for obj in response.get("Contents", [])]
-            if response.get("Contents")
-            else []
-        )
-        logger.info(f"Objects listed successfully in bucket '{bucket}'.")
-        return objects_list
-    except Exception as e:
-        logger.exception(f"Failed to list objects in bucket '{bucket}': {e}")
-        raise HTTPException(status_code=500, detail="Failed to list objects")

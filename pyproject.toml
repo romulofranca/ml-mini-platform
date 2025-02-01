@@ -15,6 +15,7 @@ boto3 = "^1.36.10"
 uvicorn = "^0.34.0"
 scikit-learn = "^1.6.1"
 python-multipart = "^0.0.20"
+sqlalchemy = "^2.0.37"
 
 
 [build-system]
