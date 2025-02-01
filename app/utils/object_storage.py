@@ -9,7 +9,6 @@ from app.config import (
     OBJECT_STORAGE_ACCESS_KEY,
     OBJECT_STORAGE_SECRET_KEY,
     DATASETS_BUCKET,
-    TRAINED_MODELS_BUCKET,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,3 +37,37 @@ def load_dataset_from_storage(dataset_key: str) -> pd.DataFrame:
         raise HTTPException(
             status_code=404, detail="Dataset not found in storage"
         )
+
+
+def put_object_to_bucket(bucket: str, key: str, body) -> None:
+    try:
+        object_storage_client.put_object(Bucket=bucket, Key=key, Body=body)
+        logger.info(
+            f"Object '{key}' stored successfully in bucket '{bucket}'."
+        )
+    except Exception as e:
+        logger.exception(
+            f"Failed to put object '{key}' in bucket '{bucket}': {e}"
+        )
+        raise HTTPException(status_code=500, detail="Failed to upload object")
+
+
+def get_object_from_bucket(bucket: str, key: str):
+    try:
+        return object_storage_client.get_object(Bucket=bucket, Key=key)
+    except Exception as e:
+        logger.exception(
+            f"Failed to get object '{key}' from bucket '{bucket}': {e}"
+        )
+        raise HTTPException(status_code=404, detail="Object not found")
+
+
+def list_objects_in_bucket(bucket: str):
+    try:
+        response = object_storage_client.list_objects_v2(Bucket=bucket)
+        if "Contents" in response:
+            return [obj["Key"] for obj in response["Contents"]]
+        return []
+    except Exception as e:
+        logger.exception(f"Failed to list objects in bucket '{bucket}': {e}")
+        raise HTTPException(status_code=500, detail="Failed to list objects")

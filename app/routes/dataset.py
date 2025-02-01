@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
     "/datasets/upload",
     response_model=DatasetResponse,
     summary="Upload and catalog a dataset",
+    tags=["datasets"],
 )
 def upload_dataset(
     file: UploadFile = File(...), db: Session = Depends(get_db)
@@ -53,6 +54,7 @@ def upload_dataset(
     "/datasets",
     response_model=List[DatasetResponse],
     summary="List all datasets",
+    tags=["datasets"],
 )
 def list_datasets(db: Session = Depends(get_db)):
     datasets = db.query(models.DatasetCatalog).all()

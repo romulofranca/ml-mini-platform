@@ -31,5 +31,6 @@ class DatasetResponse(BaseModel):
     location: str
     created_at: datetime
 
-    class Config:
-        orm_mode = True
+    model_config = {
+        "orm_mode": True
+    }

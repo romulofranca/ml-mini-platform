@@ -17,7 +17,8 @@ from app.db.session import get_db
 from app.db import models
 from app.models.pydantic_models import TrainRequest, InputData
 from app.utils.object_storage import (
-    object_storage_client,
+    put_object_to_bucket,
+    get_object_from_bucket,
     load_dataset_from_storage,
 )
 from app.utils.preprocessing import create_preprocessor, detect_target_column
@@ -27,7 +28,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-@router.post("/train", summary="Train a model")
+@router.post("/train", summary="Train a model", tags=["models"])
 def train_model(
     request: TrainRequest = Body(...), db: Session = Depends(get_db)
 ):
@@ -92,7 +93,6 @@ def train_model(
     )
     metrics["f1_score"] = f1_score(y_test, y_pred, average="weighted")
 
-    # Lookup dataset; if not found (for example use), create a dummy entry.
     dataset_entry = (
         db.query(models.DatasetCatalog)
         .filter(models.DatasetCatalog.name == dataset_name)
@@ -122,11 +122,13 @@ def train_model(
     model_data = io.BytesIO()
     pickle.dump(full_pipeline, model_data)
     model_data.seek(0)
-    object_storage_client.put_object(
-        Bucket=TRAINED_MODELS_BUCKET,
-        Key=model_file_name,
-        Body=model_data.getvalue(),
+    put_object_to_bucket(
+        TRAINED_MODELS_BUCKET, model_file_name, model_data.getvalue()
     )
+
+    # Add feature_names into parameters for use in prediction.
+    model_params = request.model.get("params", {})
+    model_params["feature_names"] = feature_names
 
     new_registry_entry = models.ModelRegistry(
         dataset_id=dataset_entry.id,
@@ -134,7 +136,7 @@ def train_model(
         stage=environment,
         artifact_path=model_file_name,
         metrics=json.dumps(metrics),
-        parameters=json.dumps(request.model.get("params", {})),
+        parameters=json.dumps(model_params),
         description="Model trained automatically",
         promotion_timestamp=None,
     )
@@ -150,7 +152,7 @@ def train_model(
     }
 
 
-@router.post("/promote", summary="Promote a model")
+@router.post("/promote", summary="Promote a model", tags=["models"])
 def promote_model(
     dataset_name: str = Body(..., embed=True),
     version: int = Body(..., embed=True),
@@ -181,12 +183,10 @@ def promote_model(
             detail="Cannot demote or promote to the same stage",
         )
     new_model_file = f"{dataset_name}_model_{target_stage}_v{version}.pkl"
-    artifact_bytes = object_storage_client.get_object(
-        Bucket=TRAINED_MODELS_BUCKET, Key=entry.artifact_path
+    artifact_bytes = get_object_from_bucket(
+        TRAINED_MODELS_BUCKET, entry.artifact_path
     )["Body"].read()
-    object_storage_client.put_object(
-        Bucket=TRAINED_MODELS_BUCKET, Key=new_model_file, Body=artifact_bytes
-    )
+    put_object_to_bucket(TRAINED_MODELS_BUCKET, new_model_file, artifact_bytes)
     entry.stage = target_stage
     entry.artifact_path = new_model_file
     entry.promotion_timestamp = datetime.now()
@@ -228,8 +228,8 @@ def predict(
             status_code=404, detail="No model found for the given environment"
         )
 
-    model_response = object_storage_client.get_object(
-        Bucket=TRAINED_MODELS_BUCKET, Key=entry.artifact_path
+    model_response = get_object_from_bucket(
+        TRAINED_MODELS_BUCKET, entry.artifact_path
     )
     model_pipeline = pickle.loads(model_response["Body"].read())
     input_df = pd.DataFrame(input_data.features)
