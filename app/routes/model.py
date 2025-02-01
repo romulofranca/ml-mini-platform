@@ -200,7 +200,9 @@ def promote_model(
     }
 
 
-@router.post("/predict", summary="Make predictions with a model")
+@router.post(
+    "/predict", summary="Make predictions with a model", tags=["models"]
+)
 def predict(
     dataset_name: str = Body(..., embed=True),
     environment: str = Body(..., embed=True),
