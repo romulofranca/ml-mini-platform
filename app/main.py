@@ -58,7 +58,7 @@ app.add_exception_handler(Exception, generic_exception_handler)
 app.add_exception_handler(HTTPException, http_exception_handler)
 
 
-@app.get("/", summary="Check API status")
+@app.get("/", summary="Check API status", tags=["meta"])
 def home():
     return {"message": "ML Mini Platform is running!"}
 
