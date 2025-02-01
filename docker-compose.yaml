@@ -20,13 +20,12 @@ services:
     depends_on:
       - minio
     environment:
-      MINIO_ENDPOINT: "http://minio:9000"
-      MINIO_ACCESS_KEY: "minioadmin"
-      MINIO_SECRET_KEY: "minioadmin"
+      OBJECT_STORAGE_ENDPOINT: "http://minio:9000"
+      OBJECT_STORAGE_ACCESS_KEY: "minioadmin"
+      OBJECT_STORAGE_SECRET_KEY: "minioadmin"
       DATASETS_BUCKET: "datasets"
       TRAINED_MODELS_BUCKET: "trained-models"
-      MODEL_FILE_NAME: "model.pkl"
-    command: ["poetry", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["poetry", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 volumes:
   minio_data:
