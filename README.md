@@ -53,6 +53,8 @@ The **ML Mini Platform** is a lightweight, containerized solution that streamlin
   - **Pydantic**: For request/response validation  
   - **Uvicorn**: ASGI server for FastAPI  
   - **Boto3**: For interacting with object storage
+  - **Pandas**: For dataset handling and preprocessing
+  - **Scikit-Learn (sklearn)**: For ML model training and preprocessing
 
 ---
 
@@ -65,7 +67,7 @@ The **ML Mini Platform** is a lightweight, containerized solution that streamlin
 2. **Build & Run:**  
    In your project directory, run:
    ```bash
-   docker-compose up --build
+   docker compose up --build
    ```
    This command will:
    - Build the application container.
@@ -184,6 +186,12 @@ This request uses the latest model for `my_dataset` in the staging environment t
 
 ## 🔮 Future Decisions to Improve the Platform
 
+- **Web UI for Easier Management:**  
+  Introduce a user-friendly web interface using React or Vue.js to allow seamless dataset management, model tracking, and deployment without requiring API calls.
+
+- **Expanded Model Support:**  
+  Extend the platform beyond Scikit-Learn by supporting additional ML and deep learning frameworks, such as TensorFlow, PyTorch, XGBoost, and others, enabling a broader range of model training and deployment options.
+
 - **Enhanced Database Management:**  
   Migrate from SQLite to PostgreSQL or MySQL for better performance, concurrency, and scalability.
 
@@ -204,31 +212,39 @@ This request uses the latest model for `my_dataset` in the staging environment t
 
 ---
 
-## ☁️ Architecture on AWS
+## ☁️ Architecture on AWS  
 
-**AWS Architecture Overview:**
+**AWS Architecture Overview:**  
 
-This platform can be deployed on AWS using the following components to ensure reliability, scalability, and cost-effectiveness:
+This platform can be deployed on AWS using a **scalable, reliable, and cost-efficient** architecture for **machine learning workloads**. The following components ensure **performance, automation, and ease of management**:  
 
-- **Amazon ECS/Fargate or EC2:**  
-  Run containerized services (FastAPI application, MinIO replaced by S3 in production) using ECS/Fargate for serverless containers or EC2 with auto-scaling groups.
+- **Amazon EKS or ECS/Fargate:**  
+  Deploy and orchestrate containerized services efficiently.  
+  - **EKS (Elastic Kubernetes Service):** Ideal for **Kubernetes-native** teams, offering seamless scaling, GitOps integration, and fine-grained workload control.  
+  - **ECS (Elastic Container Service) with Fargate:** A **serverless container solution** that eliminates infrastructure management, scaling automatically based on demand.  
 
 - **Amazon S3:**  
-  Replace MinIO for production-grade object storage. S3 offers high durability, scalability, and low cost for storing datasets and model artifacts.
+  Provides **scalable, durable, and cost-effective** object storage, replacing MinIO in production. Used for **datasets, model artifacts, and preprocessing outputs**.  
 
 - **Amazon RDS (PostgreSQL/MySQL):**  
-  Replace SQLite with a managed relational database for higher concurrency, availability, and ease of scaling.
+  A **managed relational database** replacing SQLite, offering **higher concurrency, automated backups, and scalability** for tracking datasets and model versions.  
+
+- **Amazon EMR:**  
+  **Optimizes large-scale data processing** using **Apache Spark, Hadoop, or Presto** for preprocessing datasets before training, reducing computational overhead on the application.  
+
+- **Amazon SageMaker:**  
+  A **fully managed ML environment** for training, versioning, and deploying models at scale. Supports **distributed training, hyperparameter tuning, and real-time model hosting** via **SageMaker Endpoints**.  
 
 - **Elastic Load Balancer (ELB):**  
-  Distribute incoming traffic across multiple instances of the ML platform to ensure high availability.
+  Distributes incoming traffic **across multiple application instances**, ensuring **high availability, automatic failover, and scalability**.  
 
 - **AWS CloudWatch:**  
-  Monitor logs and performance metrics, and set up alarms for operational insights.
+  Monitors **logs, performance metrics, and ML model health** in real-time, with **automated alerts for performance degradation**.  
 
 - **AWS IAM & Security Groups:**  
-  Enforce least-privilege access policies and secure network communications between services.
+  Enforces **strict access control policies** using **RBAC (Role-Based Access Control)** and secure network segmentation to **protect data and services**.  
 
 - **AWS CodePipeline/CodeDeploy:**  
-  Automate the CI/CD workflow to deploy updates reliably and quickly.
+  Automates **CI/CD workflows** for the **FastAPI application, ML model training, and deployments**, ensuring **reliable and efficient updates**.  
 
-This AWS architecture is designed to be highly reliable, scalable, and cost-effective, ensuring that your ML platform can handle production workloads while keeping operational costs low.
+This AWS architecture enhances the platform with **large-scale data processing (EMR), scalable ML training & deployment (SageMaker), and efficient orchestration (EKS/ECS)**, creating a **cost-effective, high-performance machine learning environment**. 🚀
