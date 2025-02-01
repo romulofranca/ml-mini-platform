@@ -12,6 +12,18 @@ services:
     volumes:
       - minio_data:/data
 
+  # Init container to create buckets in MinIO using the minio client (mc)
+  init:
+    image: minio/mc
+    container_name: minio_init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "until mc alias set myminio http://minio:9000 minioadmin minioadmin; do sleep 1; done;
+      mc mb --ignore-existing myminio/datasets;
+      mc mb --ignore-existing myminio/trained-models"
+    restart: "no"
+
   app:
     build: .
     container_name: ml_api
@@ -19,13 +31,20 @@ services:
       - "8000:8000"
     depends_on:
       - minio
+      - init
     environment:
+      # Use SQLite by default; the app will check if the DB file exists and create it if necessary.
+      DATABASE_URL: "sqlite:///./data/ml_registry.db"
       OBJECT_STORAGE_ENDPOINT: "http://minio:9000"
       OBJECT_STORAGE_ACCESS_KEY: "minioadmin"
       OBJECT_STORAGE_SECRET_KEY: "minioadmin"
       DATASETS_BUCKET: "datasets"
       TRAINED_MODELS_BUCKET: "trained-models"
+    # Mount a volume for the SQLite database file.
+    volumes:
+      - ml_registry_data:/app/data
     command: ["poetry", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 volumes:
   minio_data:
+  ml_registry_data:

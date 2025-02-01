@@ -19,20 +19,15 @@ COPY pyproject.toml poetry.lock /app/
 RUN poetry install --no-root --only main
 
 # Copy the entire project into the container
-COPY . /app/
-
-# Set proper permissions for the virtual environment
-RUN chmod -R 755 /opt/venv
+COPY . .
 
 # Add the virtual environment's bin directory to PATH
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Create a non-root user and adjust ownership for shared directories and the app folder
 RUN useradd -m appuser \
-    && mkdir /shared_data && chown -R appuser:appuser /shared_data \
-    && chown -R appuser /app
+    && mkdir /app/data && chown -R appuser:appuser /app/data
 
-# Switch to the non-root user
 USER appuser
 
 # Expose the application port
