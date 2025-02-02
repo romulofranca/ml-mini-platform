@@ -71,3 +71,16 @@ def list_objects_in_bucket(bucket: str):
     except Exception as e:
         logger.exception(f"Failed to list objects in bucket '{bucket}': {e}")
         raise HTTPException(status_code=500, detail="Failed to list objects")
+
+
+def delete_object_from_bucket(bucket: str, key: str):
+    try:
+        object_storage_client.delete_object(Bucket=bucket, Key=key)
+        logger.info(
+            f"Object '{key}' deleted successfully from bucket '{bucket}'."
+        )
+    except Exception as e:
+        logger.exception(
+            f"Failed to delete object '{key}' from bucket '{bucket}': {e}"
+        )
+        raise HTTPException(status_code=500, detail="Failed to delete object")
