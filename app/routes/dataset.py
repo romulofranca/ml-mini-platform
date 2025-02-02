@@ -1,14 +1,13 @@
-import json
 import logging
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from typing import List, Optional
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.db import models
 from app.utils.string_utils import normalize_dataset_name
 from app.config import DATASETS_BUCKET
 from app.utils.object_storage import object_storage_client
-from app.models.pydantic_models import DatasetResponse, ModelResponse
+from app.models.pydantic_models import DatasetResponse
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -21,7 +20,8 @@ logger = logging.getLogger(__name__)
     description=(
         "Upload a file to create a new dataset entry. The file is stored in "
         "the configured object storage, and a corresponding record "
-        "is added to the dataset catalog."
+        "is added to the dataset catalog. "
+        "You can optionally provide a `description` for the dataset."
     ),
     tags=["datasets"],
     responses={
@@ -32,9 +32,12 @@ logger = logging.getLogger(__name__)
                 "application/json": {
                     "example": {
                         "id": 1,
-                        "name": "my_dataset_csv",
-                        "description": "",
-                        "location": "my_dataset_csv",
+                        "name": "my_dataset",
+                        "description": (
+                            "A sample dataset containing climate data"
+                        ),
+                        "location": "my_dataset",
+                        "created_at": "2025-02-02T15:42:57",
                     }
                 }
             },
@@ -42,21 +45,27 @@ logger = logging.getLogger(__name__)
     },
 )
 def upload_dataset(
-    file: UploadFile = File(...), db: Session = Depends(get_db)
+    file: UploadFile = File(...),
+    description: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
 ) -> DatasetResponse:
     """
     Uploads a new dataset file and catalogs it in the database.
 
     **Args**:
     - file (UploadFile): The dataset file to be uploaded.
+    - description (str, optional): A brief description of the dataset.
 
     **Raises**:
-    - HTTPException(400): If a dataset filename already exists.
+    - HTTPException(400): If a dataset with the same name already exists.
 
     **Returns**:
-    - (DatasetResponse): The newly created dataset entry.
+    - (DatasetResponse): The newly created dataset entry, including the
+      optional description.
     """
+
     normalized_name = normalize_dataset_name(file.filename)
+
     existing = (
         db.query(models.DatasetCatalog)
         .filter(models.DatasetCatalog.name == normalized_name)
@@ -75,11 +84,15 @@ def upload_dataset(
     )
 
     new_dataset = models.DatasetCatalog(
-        name=normalized_name, description="", location=file.filename
+        name=normalized_name,
+        description=description
+        or "",
+        location=file.filename,
     )
     db.add(new_dataset)
     db.commit()
     db.refresh(new_dataset)
+
     logger.info(
         f"Dataset '{normalized_name}' has been uploaded and cataloged."
     )
@@ -100,15 +113,17 @@ def upload_dataset(
                     "example": [
                         {
                             "id": 1,
-                            "name": "my_dataset_csv",
+                            "name": "my_dataset",
                             "description": "",
-                            "location": "my_dataset_csv",
+                            "location": "my_dataset",
+                            "created_at": "2025-02-02T15:42:57",
                         },
                         {
                             "id": 2,
-                            "name": "another_dataset_parquet",
+                            "name": "another_dataset",
                             "description": "Additional info",
-                            "location": "another_dataset_parquet",
+                            "location": "another_dataset",
+                            "created_at": "2025-02-02T15:42:57",
                         },
                     ]
                 }
@@ -130,62 +145,36 @@ def list_datasets(db: Session = Depends(get_db)) -> List[DatasetResponse]:
     return datasets
 
 
-@router.get(
-    "/models",
-    summary="List all models in the registry",
-    description=(
-        "Retrieve a list of all models registered in the system, "
-        "including their dataset name, version, stage, artifact path, "
-        "metrics, and parameters."
-    ),
-    tags=["models"],
-    response_model=List[ModelResponse],
+@router.delete(
+    "/datasets/{dataset_id}",
+    summary="Delete a dataset",
+    description="Delete a dataset entry from the catalog.",
+    tags=["datasets"],
+    response_model=dict,
+    responses={
+        204: {"description": "Dataset deleted successfully"},
+        404: {"description": "Dataset not found"},
+    },
 )
-def list_models(db: Session = Depends(get_db)) -> List[ModelResponse]:
+def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
     """
-    List all models registered in the system.
+    Deletes a dataset entry from the catalog.
 
     **Args**:
-    - db (Session): SQLAlchemy session dependency.
+    - dataset_id (int): The ID of the dataset to delete.
+    - db (Session): The database session.
+
+    **Raises**:
+    - HTTPException(404): If the dataset ID is not found.
 
     **Returns**:
-    - (List[ModelResponse]): A list of all registered models, with `metrics`
-      and `parameters` parsed into dictionaries.
+    - (dict): A message confirming the deletion.
     """
+    dataset = db.query(models.DatasetCatalog).get(dataset_id)
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
 
-    model_records = db.query(models.ModelRegistry).all()
-
-    model_responses = []
-    for record in model_records:
-        if isinstance(record.metrics, str):
-            try:
-                metrics_dict = json.loads(record.metrics)
-            except json.JSONDecodeError:
-                metrics_dict = {}
-        else:
-            metrics_dict = record.metrics or {}
-
-        if isinstance(record.parameters, str):
-            try:
-                parameters_dict = json.loads(record.parameters)
-            except json.JSONDecodeError:
-                parameters_dict = {}
-        else:
-            parameters_dict = record.parameters or {}
-
-        model_responses.append(
-            ModelResponse(
-                id=record.id,
-                dataset_id=record.dataset_id,
-                version=record.version,
-                stage=record.stage,
-                artifact_path=record.artifact_path,
-                metrics=metrics_dict,
-                parameters=parameters_dict,
-                description=record.description,
-                timestamp=record.timestamp,
-                promotion_timestamp=record.promotion_timestamp,
-            )
-        )
-
-    return model_responses
+    db.delete(dataset)
+    db.commit()
+    logger.info(f"Dataset '{dataset.name}' has been deleted.")
+    return {"message": f"Dataset '{dataset.name}' has been deleted."}
