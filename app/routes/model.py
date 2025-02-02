@@ -23,7 +23,9 @@ from app.models.pydantic_models import (
     InputData,
     TrainResponse,
 )
+from app.utils.constants import EnvironmentEnum
 from app.utils.object_storage import (
+    delete_object_from_bucket,
     put_object_to_bucket,
     get_object_from_bucket,
     load_dataset_from_storage,
@@ -64,9 +66,9 @@ logger = logging.getLogger(__name__)
                 "application/json": {
                     "example": {
                         "message": "Model trained and registered successfully",
-                        "dataset": "co2_emissions",
+                        "dataset": "CO2_emission",
                         "version": 1,
-                        "model_file": "co2_emissions_model_dev_v1.pkl",
+                        "model_file": "CO2_emission_model_dev_v1.pkl",
                         "metrics": {
                             "f1_score": 0.95,
                             "accuracy": 0.97,
@@ -84,7 +86,7 @@ def train_model(
     request: TrainRequest = Body(
         ...,
         example={
-            "dataset_name": "co2_emissions",
+            "dataset_name": "CO2_emission",
             "use_example": False,
             "target_column": "Smog_Level",
             "model": {
@@ -202,7 +204,6 @@ def train_model(
         TRAINED_MODELS_BUCKET, model_file_name, model_data.getvalue()
     )
 
-    # Add feature_names into parameters for use in prediction.
     model_params = request.model.get("params", {})
     model_params["feature_names"] = feature_names
 
@@ -249,9 +250,9 @@ def train_model(
                 "application/json": {
                     "example": {
                         "message": "Model promoted to production successfully",
-                        "dataset": "co2_emissions",
+                        "dataset": "CO2_emission",
                         "version": 1,
-                        "model_file": "co2_emissions_model_production_v1.pkl",
+                        "model_file": "CO2_emission_model_production_v1.pkl",
                     }
                 }
             },
@@ -261,7 +262,7 @@ def train_model(
 def promote_model(
     dataset_name: str = Body(..., embed=True, example={"co2_emission"}),
     version: int = Body(..., embed=True, example={1}),
-    target_stage: str = Body(..., embed=True, example={"production"}),
+    environment: str = Body(..., embed=True, example={"production"}),
     db: Session = Depends(get_db),
 ):
     """
@@ -294,24 +295,28 @@ def promote_model(
     )
     if not entry:
         raise HTTPException(status_code=404, detail="Model version not found")
-    promotion_order = {"dev": 1, "staging": 2, "production": 3}
-    if promotion_order[target_stage] <= promotion_order[entry.stage]:
+    promotion_order = {
+        EnvironmentEnum.dev.value: 1,
+        EnvironmentEnum.staging.value: 2,
+        EnvironmentEnum.production.value: 3,
+    }
+    if promotion_order[environment] <= promotion_order[entry.stage]:
         raise HTTPException(
             status_code=400,
             detail="Cannot demote or promote to the same stage",
         )
-    new_model_file = f"{dataset_name}_model_{target_stage}_v{version}.pkl"
+    new_model_file = f"{dataset_name}_model_{environment}_v{version}.pkl"
     artifact_bytes = get_object_from_bucket(
         TRAINED_MODELS_BUCKET, entry.artifact_path
     )["Body"].read()
     put_object_to_bucket(TRAINED_MODELS_BUCKET, new_model_file, artifact_bytes)
-    entry.stage = target_stage
+    entry.stage = environment
     entry.artifact_path = new_model_file
     entry.promotion_timestamp = datetime.now()
     db.commit()
     db.refresh(entry)
     return {
-        "message": f"Model promoted to {target_stage} successfully",
+        "message": f"Model promoted to {environment} successfully",
         "dataset": dataset_name,
         "version": version,
         "model_file": new_model_file,
@@ -424,3 +429,284 @@ def list_models(db: Session = Depends(get_db)):
     - (List[ModelRegistry]): A list of all registered models.
     """
     return db.query(models.ModelRegistry).all()
+
+
+@router.delete(
+    "/models/remove",
+    summary="Remove a model from the registry",
+    description=(
+        "Deletes a specific model version from the registry. "
+        "This also removes the associated model file from object storage. "
+        "The environment (dev, staging, production) must be specified."
+    ),
+    tags=["models"],
+    responses={
+        404: {"description": "Dataset or model version not found"},
+        200: {
+            "description": "Model removed successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "message": (
+                            "Model version 1 removed successfully from staging"
+                        ),
+                        "dataset": "CO2_emission",
+                        "version": 1,
+                        "environment": "staging",
+                    }
+                }
+            },
+        },
+        500: {
+            "description": "Error deleting the model file from object storage",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": "Failed to delete object from storage"
+                    }
+                }
+            },
+        },
+    },
+)
+def remove_model(
+    dataset_name: str = Body(..., embed=True, example="CO2_emission"),
+    version: int = Body(..., embed=True, example=1),
+    environment: EnvironmentEnum = Body(
+        ..., embed=True, example=EnvironmentEnum.staging
+    ),  # ✅ Use Enum for validation
+    db: Session = Depends(get_db),
+):
+    """
+    Remove a model from the registry.
+
+    **Args**:
+    - dataset_name (str): Name of the dataset/model family.
+    - version (int): Model version number to delete.
+    - environment (EnvironmentEnum): The environment where the model is stored
+      (dev, staging, production).
+
+    **Returns**:
+    - (dict): A message confirming the model deletion.
+    """
+    dataset_entry = (
+        db.query(models.DatasetCatalog)
+        .filter(models.DatasetCatalog.name == dataset_name)
+        .first()
+    )
+    if not dataset_entry:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    entry = (
+        db.query(models.ModelRegistry)
+        .filter(
+            models.ModelRegistry.dataset_id == dataset_entry.id,
+            models.ModelRegistry.version == version,
+            models.ModelRegistry.stage
+            == environment.value,  # ✅ Use .value to extract string from Enum
+        )
+        .first()
+    )
+    if not entry:
+        raise HTTPException(
+            status_code=404,
+            detail="Model version not found in specified environment",
+        )
+
+    # Delete model file from object storage
+    try:
+        delete_object_from_bucket(TRAINED_MODELS_BUCKET, entry.artifact_path)
+    except HTTPException:
+        raise HTTPException(
+            status_code=500, detail="Failed to delete object from storage"
+        )
+
+    # Remove model entry from database
+    db.delete(entry)
+    db.commit()
+
+    return {
+        "message": (
+            f"Model version {version} removed successfully from "
+            f"{environment.value}"
+        ),
+        "dataset": dataset_name,
+        "version": version,
+        "environment": environment.value,
+    }
+
+
+@router.get(
+    "/models/by-dataset",
+    summary="List models filtered by dataset",
+    description="Retrieve all models associated with a specific dataset name.",
+    tags=["models"],
+    response_model=List[ModelResponse],
+    responses={
+        404: {"description": "Dataset not found"},
+        200: {
+            "description": (
+                "Returns a list of models for the specified dataset"
+            ),
+            "content": {
+                "application/json": {
+                    "example": [
+                        {
+                            "id": 1,
+                            "dataset_id": 12,
+                            "version": 3,
+                            "stage": "production",
+                            "artifact_path": "co2_model_v3.pkl",
+                            "metrics": {"accuracy": 0.95, "f1_score": 0.93},
+                            "parameters": {
+                                "n_estimators": 100,
+                                "max_depth": 10,
+                            },
+                            "description": "CO2 emissions prediction model",
+                            "timestamp": "2024-01-30T12:45:00",
+                            "promotion_timestamp": "2024-02-02T14:10:00",
+                        }
+                    ]
+                }
+            },
+        },
+    },
+)
+def list_models_by_dataset(
+    dataset_name: str,
+    db: Session = Depends(get_db),
+):
+    """
+    List models filtered by dataset.
+
+    **Args**:
+    - dataset_name (str): Name of the dataset to filter models by.
+
+    **Returns**:
+    - (List[ModelResponse]): A list of models associated with the specified
+      dataset.
+    """
+    dataset_entry = (
+        db.query(models.DatasetCatalog)
+        .filter(models.DatasetCatalog.name == dataset_name)
+        .first()
+    )
+    if not dataset_entry:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    models_list = (
+        db.query(models.ModelRegistry)
+        .filter(models.ModelRegistry.dataset_id == dataset_entry.id)
+        .all()
+    )
+
+    return [
+        ModelResponse(
+            id=model.id,
+            dataset_id=model.dataset_id,
+            version=model.version,
+            stage=model.stage,
+            artifact_path=model.artifact_path,
+            metrics=(
+                json.loads(model.metrics)
+                if isinstance(model.metrics, str)
+                else model.metrics
+            ),
+            parameters=(
+                json.loads(model.parameters)
+                if isinstance(model.parameters, str)
+                else model.parameters
+            ),
+            description=model.description,
+            timestamp=model.timestamp,
+            promotion_timestamp=model.promotion_timestamp,
+        )
+        for model in models_list
+    ]
+
+
+@router.get(
+    "/models/by-environment",
+    summary="List models filtered by environment",
+    description=(
+        "Retrieve all models that are currently in a specified environment "
+        "(dev, staging, production)."
+    ),
+    tags=["models"],
+    response_model=List[ModelResponse],
+    responses={
+        400: {"description": "Invalid environment specified"},
+        200: {
+            "description": (
+                "Returns a list of models in the specified environment"
+            ),
+            "content": {
+                "application/json": {
+                    "example": [
+                        {
+                            "id": 1,
+                            "dataset_id": 12,
+                            "version": 3,
+                            "stage": "staging",
+                            "artifact_path": "co2_model_v3.pkl",
+                            "metrics": {"accuracy": 0.95, "f1_score": 0.93},
+                            "parameters": {
+                                "n_estimators": 100,
+                                "max_depth": 10,
+                            },
+                            "description": "CO2 emissions prediction model",
+                            "timestamp": "2024-01-30T12:45:00",
+                            "promotion_timestamp": "2024-02-02T14:10:00",
+                        }
+                    ]
+                }
+            },
+        },
+    },
+)
+def list_models_by_environment(
+    environment: EnvironmentEnum,
+    db: Session = Depends(get_db),
+):
+    """
+    List models filtered by environment.
+
+    **Args**:
+    - environment (EnvironmentEnum): The environment to filter models by
+      (dev, staging, production).
+
+    **Returns**:
+    - (List[ModelResponse]): A list of models deployed in the specified
+      environment.
+    """
+    models_list = (
+        db.query(models.ModelRegistry)
+        .filter(
+            models.ModelRegistry.stage == environment.value
+        )
+        .all()
+    )
+
+    return [
+        ModelResponse(
+            id=model.id,
+            dataset_id=model.dataset_id,
+            version=model.version,
+            stage=model.stage,
+            artifact_path=model.artifact_path,
+            metrics=(
+                json.loads(model.metrics)
+                if isinstance(model.metrics, str)
+                else model.metrics
+            ),
+            parameters=(
+                json.loads(model.parameters)
+                if isinstance(model.parameters, str)
+                else model.parameters
+            ),
+            description=model.description,
+            timestamp=model.timestamp,
+            promotion_timestamp=model.promotion_timestamp,
+        )
+        for model in models_list
+    ]
