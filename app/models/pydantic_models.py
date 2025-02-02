@@ -1,6 +1,6 @@
-from typing import List, Optional, Dict
+from typing import Any, List, Optional, Dict
 from datetime import datetime
-from pydantic import BaseModel, field_validator, ConfigDict
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 
 
 class TrainRequest(BaseModel):
@@ -30,5 +30,32 @@ class DatasetResponse(BaseModel):
     description: str
     location: str
     created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TrainResponse(BaseModel):
+    message: str = Field(
+        ..., example="Model trained and registered successfully"
+    )
+    dataset: str = Field(..., example="iris-sample")
+    version: int = Field(..., example=1)
+    model_file: str = Field(..., example="iris-sample_model_dev_v1.pkl")
+    metrics: Dict[str, Any] = Field(
+        ..., example={"accuracy": 0.95, "f1_score": 0.93}
+    )
+
+
+class ModelResponse(BaseModel):
+    id: int
+    dataset_id: int
+    version: int
+    stage: str
+    artifact_path: str
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+    description: str
+    timestamp: datetime
+    promotion_timestamp: Optional[datetime]
 
     model_config = ConfigDict(from_attributes=True)

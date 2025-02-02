@@ -2,6 +2,7 @@ import io
 import json
 import logging
 import pickle
+from typing import List
 from datetime import datetime
 from importlib import import_module
 
@@ -13,9 +14,15 @@ from sklearn.metrics import classification_report, f1_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 
+
 from app.db.session import get_db
 from app.db import models
-from app.models.pydantic_models import TrainRequest, InputData
+from app.models.pydantic_models import (
+    ModelResponse,
+    TrainRequest,
+    InputData,
+    TrainResponse,
+)
 from app.utils.object_storage import (
     put_object_to_bucket,
     get_object_from_bucket,
@@ -28,11 +35,80 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-@router.post("/train", summary="Train a model", tags=["models"])
+@router.post(
+    "/train",
+    summary="Train a model on a given dataset",
+    tags=["models"],
+    description=(
+        "Use this endpoint to train a new machine learning model on a "
+        "specified dataset (optionally using a sample dataset like Iris). "
+        "If a model configuration is provided, it will dynamically load "
+        "and train that model from the scikit-learn library. "
+        "Otherwise, it uses default parameters."
+    ),
+    response_model=TrainResponse,
+    responses={
+        400: {
+            "description": (
+                "Invalid request or configuration "
+                "(e.g., missing target_column)"
+            )
+        },
+        404: {"description": "Dataset not found"},
+        200: {
+            "description": (
+                "Returns a JSON object containing the model metadata and "
+                "metrics."
+            ),
+            "content": {
+                "application/json": {
+                    "example": {
+                        "message": "Model trained and registered successfully",
+                        "dataset": "co2_emissions",
+                        "version": 1,
+                        "model_file": "co2_emissions_model_dev_v1.pkl",
+                        "metrics": {
+                            "f1_score": 0.95,
+                            "accuracy": 0.97,
+                            "precision": {"0": 0.96, "1": 0.94},
+                            "recall": {"0": 0.98, "1": 0.93},
+                            # etc...
+                        },
+                    }
+                }
+            },
+        },
+    },
+)
 def train_model(
-    request: TrainRequest = Body(...), db: Session = Depends(get_db)
+    request: TrainRequest = Body(
+        ...,
+        example={
+            "dataset_name": "co2_emissions",
+            "use_example": False,
+            "target_column": "Smog_Level",
+            "model": {
+                "module": "sklearn.ensemble",
+                "class": "RandomForestClassifier",
+                "params": {"n_estimators": 100},
+            },
+            "test_size": 0.2,
+            "random_state": 42,
+        },
+    ),
+    db: Session = Depends(get_db),
 ):
-    # Use example dataset if specified; otherwise, load from catalog.
+    """
+    Trains a machine learning model on a dataset.
+
+    **Args**:
+    - request (TrainRequest): The training configuration and dataset details.
+    - db (Session): SQLAlchemy session dependency.
+
+    **Returns**:
+    - (TrainResponse): A success message, dataset name, model version,
+     artifact path, and evaluation metrics.
+    """
     if request.use_example:
         dataset_name = "iris-sample"
         iris = datasets.load_iris()
@@ -152,13 +228,55 @@ def train_model(
     }
 
 
-@router.post("/promote", summary="Promote a model", tags=["models"])
+@router.post(
+    "/promote",
+    summary="Promote a model to a new stage",
+    description=(
+        "Promote a model (identified by dataset name and version) from its"
+        "current stage (e.g., dev) to a "
+        "higher stage (e.g., staging or production). "
+        "Demotion or re-promotion to the same stage is not allowed."
+    ),
+    tags=["models"],
+    responses={
+        400: {"description": "Cannot demote or promote to the same stage"},
+        404: {"description": "Dataset or model version not found"},
+        200: {
+            "description": (
+                "Returns a message confirming the successful promotion."
+            ),
+            "content": {
+                "application/json": {
+                    "example": {
+                        "message": "Model promoted to production successfully",
+                        "dataset": "co2_emissions",
+                        "version": 1,
+                        "model_file": "co2_emissions_model_production_v1.pkl",
+                    }
+                }
+            },
+        },
+    },
+)
 def promote_model(
-    dataset_name: str = Body(..., embed=True),
-    version: int = Body(..., embed=True),
-    target_stage: str = Body(..., embed=True),
+    dataset_name: str = Body(..., embed=True, example={"co2_emission"}),
+    version: int = Body(..., embed=True, example={1}),
+    target_stage: str = Body(..., embed=True, example={"production"}),
     db: Session = Depends(get_db),
 ):
+    """
+    Promote a trained model to a higher stage
+    (e.g., dev -> staging -> production).
+
+    **Args**:
+    - dataset_name (str): Name of the dataset/model family.
+    - version (int): Model version number to promote.
+    - target_stage (str): The new stage to promote the model to
+      (e.g., staging or production).
+
+    **Returns**:
+    - (dict): A message confirming the promotion, along with metadata.
+    """
     dataset_entry = (
         db.query(models.DatasetCatalog)
         .filter(models.DatasetCatalog.name == dataset_name)
@@ -201,14 +319,57 @@ def promote_model(
 
 
 @router.post(
-    "/predict", summary="Make predictions with a model", tags=["models"]
+    "/predict",
+    summary="Make predictions using a deployed model",
+    description=(
+        "Use this endpoint to send data for inference using a model in a "
+        "specific environment (dev, staging, or production). "
+        "The endpoint will load the appropriate model pipeline and "
+        "run prediction on the input data."
+    ),
+    tags=["models"],
+    responses={
+        404: {
+            "description": (
+                "Dataset or model stage not found (no model in that stage)."
+            )
+        },
+        200: {
+            "description": (
+                "Returns a list of predictions for each provided input row."
+            ),
+            "content": {
+                "application/json": {"example": {"predictions": [0, 1, 1]}}
+            },
+        },
+    },
 )
 def predict(
-    dataset_name: str = Body(..., embed=True),
-    environment: str = Body(..., embed=True),
-    input_data: InputData = Body(...),
+    dataset_name: str = Body(..., embed=True, example={"co2_emission"}),
+    environment: str = Body(..., embed=True, example={"production"}),
+    input_data: InputData = Body(
+        ...,
+        example={
+            "features": [
+                [120.5, 75.3, 1],  # Example row
+                [145.2, 80.1, 0],  # Another example row
+            ]
+        },
+    ),
     db: Session = Depends(get_db),
 ):
+    """
+    Perform prediction using the latest model in the given environment.
+
+    **Args**:
+    - dataset_name (str): Name of the dataset/model family.
+    - environment (str): The environment from which to load the model
+     (dev, staging, or production).
+    - input_data (InputData): The input features for inference.
+
+    **Returns**:
+    - (dict): A dictionary containing the model predictions.
+    """
     dataset_entry = (
         db.query(models.DatasetCatalog)
         .filter(models.DatasetCatalog.name == dataset_name)
@@ -240,3 +401,26 @@ def predict(
         input_df.columns = params["feature_names"]
     predictions = model_pipeline.predict(input_df)
     return {"predictions": predictions.tolist()}
+
+
+@router.get(
+    "/models",
+    summary="List all models in the registry",
+    description=(
+        "Retrieve a list of all models registered in the system, "
+        "including their dataset name, version, stage, and artifact path."
+    ),
+    tags=["models"],
+    response_model=List[ModelResponse],
+)
+def list_models(db: Session = Depends(get_db)):
+    """
+    List all models registered in the system.
+
+    **Args**:
+    - db (Session): SQLAlchemy session dependency.
+
+    **Returns**:
+    - (List[ModelRegistry]): A list of all registered models.
+    """
+    return db.query(models.ModelRegistry).all()
