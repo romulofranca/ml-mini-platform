@@ -16,3 +16,8 @@ def normalize_dataset_name(file_name: str) -> str:
     base = re.sub(r"\W+", "_", base)
     base = base.strip("_")
     return base
+
+
+def extract_model_name(artifact_path: str) -> str:
+    """Extracts the model name from the artifact path."""
+    return os.path.splitext(os.path.basename(artifact_path))[0]

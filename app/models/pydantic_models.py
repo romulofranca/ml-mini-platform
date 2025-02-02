@@ -59,3 +59,31 @@ class ModelResponse(BaseModel):
     promotion_timestamp: Optional[datetime]
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class ModelListResponse(BaseModel):
+    """Simplified response for listing models."""
+    id: int
+    name: str
+    version: int
+    environment: str
+    dataset_name: str
+    f1_score: Optional[float] = None
+    accuracy: Optional[float] = None
+    trained_at: str
+    promoted_at: Optional[str] = None
+
+
+class ModelDetailResponse(BaseModel):
+    """Detailed response for retrieving a specific model."""
+    id: int
+    name: str
+    version: int
+    environment: str
+    dataset_name: str
+    artifact_path: str
+    metrics: Dict[str, Any]
+    parameters: Dict[str, Any]
+    description: str
+    trained_at: str
+    promoted_at: Optional[str] = None

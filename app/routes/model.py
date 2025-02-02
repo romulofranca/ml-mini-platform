@@ -2,12 +2,12 @@ import io
 import json
 import logging
 import pickle
-from typing import List
+from typing import List, Optional
 from datetime import datetime
 from importlib import import_module
 
 import pandas as pd
-from fastapi import APIRouter, Depends, HTTPException, Body
+from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
 from sklearn import datasets
 from sklearn.metrics import classification_report, f1_score
@@ -18,8 +18,9 @@ from sklearn.pipeline import Pipeline
 from app.db.session import get_db
 from app.db import models
 from app.models.pydantic_models import (
+    ModelDetailResponse,
+    ModelListResponse,
     ModelResponse,
-    TrainRequest,
     InputData,
     TrainResponse,
 )
@@ -32,6 +33,7 @@ from app.utils.object_storage import (
 )
 from app.utils.preprocessing import create_preprocessor, detect_target_column
 from app.config import TRAINED_MODELS_BUCKET
+from app.utils.string_utils import extract_model_name
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -39,29 +41,19 @@ logger = logging.getLogger(__name__)
 
 @router.post(
     "/train",
-    summary="Train a model on a given dataset",
-    tags=["models"],
+    summary="Train a model on a dataset",
     description=(
-        "Use this endpoint to train a new machine learning model on a "
-        "specified dataset (optionally using a sample dataset like Iris). "
-        "If a model configuration is provided, it will dynamically load "
-        "and train that model from the scikit-learn library. "
-        "Otherwise, it uses default parameters."
+        "Trains a new machine learning model using the specified dataset, "
+        "target column, and model configuration. "
+        "The trained model is then stored and registered."
     ),
+    tags=["models"],
     response_model=TrainResponse,
     responses={
-        400: {
-            "description": (
-                "Invalid request or configuration "
-                "(e.g., missing target_column)"
-            )
-        },
+        400: {"description": "Invalid request or model configuration"},
         404: {"description": "Dataset not found"},
         200: {
-            "description": (
-                "Returns a JSON object containing the model metadata and "
-                "metrics."
-            ),
+            "description": "Returns details about the trained model",
             "content": {
                 "application/json": {
                     "example": {
@@ -74,7 +66,6 @@ logger = logging.getLogger(__name__)
                             "accuracy": 0.97,
                             "precision": {"0": 0.96, "1": 0.94},
                             "recall": {"0": 0.98, "1": 0.93},
-                            # etc...
                         },
                     }
                 }
@@ -83,20 +74,43 @@ logger = logging.getLogger(__name__)
     },
 )
 def train_model(
-    request: TrainRequest = Body(
+    dataset_name: str = Query(
         ...,
-        example={
-            "dataset_name": "CO2_emission",
-            "use_example": False,
-            "target_column": "Smog_Level",
-            "model": {
-                "module": "sklearn.ensemble",
-                "class": "RandomForestClassifier",
-                "params": {"n_estimators": 100},
-            },
-            "test_size": 0.2,
-            "random_state": 42,
-        },
+        example="CO2_emission",
+        description="Name of the dataset to use for training",
+    ),
+    use_example: bool = Query(
+        False,
+        example=False,
+        description="Whether to use an example dataset (Iris)",
+    ),
+    target_column: Optional[str] = Query(
+        None,
+        example="Smog_Level",
+        description="Column to be used as the target variable",
+    ),
+    model_module: str = Query(
+        ...,
+        example="sklearn.ensemble",
+        description="Module path of the model (e.g., sklearn.ensemble)",
+    ),
+    model_class: str = Query(
+        ...,
+        example="RandomForestClassifier",
+        description="Class name of the model (e.g., RandomForestClassifier)",
+    ),
+    model_params: Optional[str] = Query(
+        "{}",
+        example='{"n_estimators": 100}',
+        description="JSON string of model hyperparameters",
+    ),
+    test_size: Optional[float] = Query(
+        0.2,
+        example=0.2,
+        description="Proportion of data used for testing (between 0 and 1)",
+    ),
+    random_state: Optional[int] = Query(
+        42, example=42, description="Random seed for reproducibility"
     ),
     db: Session = Depends(get_db),
 ):
@@ -104,65 +118,67 @@ def train_model(
     Trains a machine learning model on a dataset.
 
     **Args**:
-    - request (TrainRequest): The training configuration and dataset details.
-    - db (Session): SQLAlchemy session dependency.
+    - dataset_name (str): Name of the dataset to use for training.
+    - use_example (bool): Whether to use an example dataset (Iris).
+    - target_column (Optional[str]): Column in the dataset to be used as the target variable.
+    - model_module (str): Full module path of the ML model (e.g., sklearn.ensemble).
+    - model_class (str): Class name of the ML model (e.g., RandomForestClassifier).
+    - model_params (Optional[str]): JSON string of model hyperparameters.
+    - test_size (Optional[float]): Fraction of data to use for testing.
+    - random_state (Optional[int]): Random seed for reproducibility.
+    - db (Session): SQLAlchemy database session.
 
     **Returns**:
-    - (TrainResponse): A success message, dataset name, model version,
-     artifact path, and evaluation metrics.
+    - (TrainResponse): A response containing the model name, version, and evaluation metrics.
     """
-    if request.use_example:
+
+    if use_example:
         dataset_name = "iris-sample"
         iris = datasets.load_iris()
         df = pd.DataFrame(data=iris.data, columns=iris.feature_names)
         df["target"] = iris.target
     else:
-        dataset_name = request.dataset_name
         dataset_entry = (
             db.query(models.DatasetCatalog)
             .filter(models.DatasetCatalog.name == dataset_name)
             .first()
         )
         if not dataset_entry:
-            raise HTTPException(
-                status_code=404, detail="Dataset not found in catalog"
-            )
+            raise HTTPException(status_code=404, detail="Dataset not found")
         df = load_dataset_from_storage(dataset_entry.location)
 
-    target_column = request.target_column or detect_target_column(df)
+    target_column = target_column or detect_target_column(df)
     if target_column not in df.columns:
         raise HTTPException(
             status_code=400,
             detail=f"Target column '{target_column}' not found in dataset.",
         )
+
     X_df = df.drop(columns=[target_column])
     y = df[target_column]
     feature_names = X_df.columns.tolist()
-
     preprocessor = create_preprocessor(X_df)
+
+    # Load model dynamically
     try:
-        module_name = request.model.get("module")
-        class_name = request.model.get("class")
-        if not module_name or not class_name:
-            raise ValueError(
-                "Model configuration must include 'module' and 'class'."
-            )
-        if not module_name.startswith("sklearn."):
-            module_name = "sklearn." + module_name
-        module = import_module(module_name)
-        ModelClass = getattr(module, class_name)
-        model_instance = ModelClass(**request.model.get("params", {}))
+        module = import_module(model_module)
+        ModelClass = getattr(module, model_class)
+        parsed_params = (
+            json.loads(model_params) if model_params else {}
+        )  # Convert JSON string to dictionary
+        model_instance = ModelClass(**parsed_params)
     except Exception as e:
         logger.exception(f"Failed to load model: {e}")
         raise HTTPException(
             status_code=400, detail="Invalid model configuration"
         )
 
+    # Train model
     full_pipeline = Pipeline(
         steps=[("preprocessor", preprocessor), ("model", model_instance)]
     )
     X_train, X_test, y_train, y_test = train_test_split(
-        X_df, y, test_size=request.test_size, random_state=request.random_state
+        X_df, y, test_size=test_size, random_state=random_state
     )
     full_pipeline.fit(X_train, y_train)
     y_pred = full_pipeline.predict(X_test)
@@ -171,21 +187,7 @@ def train_model(
     )
     metrics["f1_score"] = f1_score(y_test, y_pred, average="weighted")
 
-    dataset_entry = (
-        db.query(models.DatasetCatalog)
-        .filter(models.DatasetCatalog.name == dataset_name)
-        .first()
-    )
-    if not dataset_entry:
-        dataset_entry = models.DatasetCatalog(
-            name=dataset_name,
-            description="Example dataset",
-            location="example",
-        )
-        db.add(dataset_entry)
-        db.commit()
-        db.refresh(dataset_entry)
-
+    # Register model
     existing_versions = (
         db.query(models.ModelRegistry)
         .filter(models.ModelRegistry.dataset_id == dataset_entry.id)
@@ -197,6 +199,7 @@ def train_model(
     environment = "dev"
     model_file_name = f"{dataset_name}_model_{environment}_v{version}.pkl"
 
+    # Save model to storage
     model_data = io.BytesIO()
     pickle.dump(full_pipeline, model_data)
     model_data.seek(0)
@@ -204,8 +207,9 @@ def train_model(
         TRAINED_MODELS_BUCKET, model_file_name, model_data.getvalue()
     )
 
-    model_params = request.model.get("params", {})
-    model_params["feature_names"] = feature_names
+    # Store metadata
+    model_params_dict = parsed_params
+    model_params_dict["feature_names"] = feature_names
 
     new_registry_entry = models.ModelRegistry(
         dataset_id=dataset_entry.id,
@@ -213,13 +217,14 @@ def train_model(
         stage=environment,
         artifact_path=model_file_name,
         metrics=json.dumps(metrics),
-        parameters=json.dumps(model_params),
+        parameters=json.dumps(model_params_dict),
         description="Model trained automatically",
         promotion_timestamp=None,
     )
     db.add(new_registry_entry)
     db.commit()
     db.refresh(new_registry_entry)
+
     return {
         "message": "Model trained and registered successfully",
         "dataset": dataset_name,
@@ -431,6 +436,241 @@ def list_models(db: Session = Depends(get_db)):
     return db.query(models.ModelRegistry).all()
 
 
+@router.get(
+    "/models/by-dataset",
+    summary="List models for a specific dataset",
+    description="Retrieve all models associated with a dataset in a structured response.",
+    tags=["models"],
+    response_model=List[ModelListResponse],  # ✅ Now using response model
+    responses={
+        404: {"description": "Dataset not found"},
+        200: {
+            "description": "Returns a list of models for the dataset",
+            "content": {
+                "application/json": {
+                    "example": [
+                        {
+                            "id": 3,
+                            "name": "co2_emission_model_staging_v1",
+                            "version": 1,
+                            "environment": "staging",
+                            "dataset_name": "CO2_emission",
+                            "f1_score": 0.93,
+                            "accuracy": 0.95,
+                            "trained_at": "2024-01-30 12:45:00",
+                            "promoted_at": "2024-02-02 14:10:00",
+                        }
+                    ]
+                }
+            },
+        },
+    },
+)
+def list_models_by_dataset(
+    dataset_name: str,
+    db: Session = Depends(get_db),
+):
+    """List models by dataset with structured response."""
+    dataset_entry = (
+        db.query(models.DatasetCatalog)
+        .filter(models.DatasetCatalog.name == dataset_name)
+        .first()
+    )
+    if not dataset_entry:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    models_list = (
+        db.query(models.ModelRegistry)
+        .filter(models.ModelRegistry.dataset_id == dataset_entry.id)
+        .all()
+    )
+
+    return [
+        ModelListResponse(
+            id=model.id,
+            name=extract_model_name(model.artifact_path),
+            version=model.version,
+            environment=model.stage,
+            dataset_name=dataset_name,
+            f1_score=(
+                json.loads(model.metrics).get("f1_score")
+                if isinstance(model.metrics, str)
+                else model.metrics.get("f1_score")
+            ),
+            accuracy=(
+                json.loads(model.metrics).get("accuracy")
+                if isinstance(model.metrics, str)
+                else model.metrics.get("accuracy")
+            ),
+            trained_at=model.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            promoted_at=(
+                model.promotion_timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                if model.promotion_timestamp
+                else None
+            ),
+        )
+        for model in models_list
+    ]
+
+
+@router.get(
+    "/models/by-environment",
+    summary="List models by environment",
+    description="Retrieve all models in a specific environment with structured response.",
+    tags=["models"],
+    response_model=List[
+        ModelListResponse
+    ],  # ✅ Using structured response model
+    responses={
+        400: {"description": "Invalid environment specified"},
+        200: {
+            "description": "Returns a list of models for the specified environment",
+            "content": {
+                "application/json": {
+                    "example": [
+                        {
+                            "id": 5,
+                            "name": "fraud_detection_model_production_v2",
+                            "version": 2,
+                            "environment": "production",
+                            "dataset_name": "Fraud_Detection",
+                            "f1_score": 0.92,
+                            "accuracy": 0.97,
+                            "trained_at": "2024-02-05 08:30:00",
+                        }
+                    ]
+                }
+            },
+        },
+    },
+)
+def list_models_by_environment(
+    environment: EnvironmentEnum,
+    db: Session = Depends(get_db),
+):
+    """List models by environment with structured response."""
+    models_list = (
+        db.query(models.ModelRegistry)
+        .filter(models.ModelRegistry.stage == environment.value)
+        .all()
+    )
+
+    return [
+        ModelListResponse(
+            id=model.id,
+            name=extract_model_name(model.artifact_path),
+            version=model.version,
+            environment=model.stage,
+            dataset_name=db.query(models.DatasetCatalog)
+            .filter(models.DatasetCatalog.id == model.dataset_id)
+            .first()
+            .name,
+            f1_score=(
+                json.loads(model.metrics).get("f1_score")
+                if isinstance(model.metrics, str)
+                else model.metrics.get("f1_score")
+            ),
+            accuracy=(
+                json.loads(model.metrics).get("accuracy")
+                if isinstance(model.metrics, str)
+                else model.metrics.get("accuracy")
+            ),
+            trained_at=model.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        for model in models_list
+    ]
+
+
+@router.get(
+    "/models/{model_id}",
+    summary="Get detailed model information",
+    description="Retrieve all details of a specific model, including parameters, full metrics, and storage path.",
+    tags=["models"],
+    response_model=ModelDetailResponse,  # ✅ Using detailed response model
+    responses={
+        404: {"description": "Model not found"},
+        200: {
+            "description": "Returns detailed information about a model",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "id": 3,
+                        "name": "co2_emission_model_staging_v1",
+                        "version": 1,
+                        "environment": "staging",
+                        "dataset_name": "CO2_emission",
+                        "artifact_path": "co2_emission_model_staging_v1.pkl",
+                        "metrics": {
+                            "accuracy": 0.95,
+                            "f1_score": 0.93,
+                            "precision": {"0": 0.96, "1": 0.94},
+                            "recall": {"0": 0.98, "1": 0.93},
+                        },
+                        "parameters": {
+                            "n_estimators": 100,
+                            "max_depth": 10,
+                            "feature_names": [
+                                "engine_size",
+                                "fuel_consumption",
+                                "CO2_emission",
+                            ],
+                        },
+                        "description": "CO2 emissions prediction model",
+                        "trained_at": "2024-01-30 12:45:00",
+                        "promoted_at": "2024-02-02 14:10:00",
+                    }
+                }
+            },
+        },
+    },
+)
+def get_model_by_id(
+    model_id: int,
+    db: Session = Depends(get_db),
+):
+    """Get full details of a specific model."""
+    model = (
+        db.query(models.ModelRegistry)
+        .filter(models.ModelRegistry.id == model_id)
+        .first()
+    )
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    dataset_name = (
+        db.query(models.DatasetCatalog)
+        .filter(models.DatasetCatalog.id == model.dataset_id)
+        .first()
+        .name
+    )
+
+    return ModelDetailResponse(
+        id=model.id,
+        name=extract_model_name(model.artifact_path),
+        version=model.version,
+        environment=model.stage,
+        dataset_name=dataset_name,
+        artifact_path=model.artifact_path,
+        metrics=(
+            json.loads(model.metrics)
+            if isinstance(model.metrics, str)
+            else model.metrics
+        ),
+        parameters=(
+            json.loads(model.parameters)
+            if isinstance(model.parameters, str)
+            else model.parameters
+        ),
+        description=model.description,
+        trained_at=model.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        promoted_at=(
+            model.promotion_timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            if model.promotion_timestamp
+            else None
+        ),
+    )
+
+
 @router.delete(
     "/models/remove",
     summary="Remove a model from the registry",
@@ -534,179 +774,3 @@ def remove_model(
         "version": version,
         "environment": environment.value,
     }
-
-
-@router.get(
-    "/models/by-dataset",
-    summary="List models filtered by dataset",
-    description="Retrieve all models associated with a specific dataset name.",
-    tags=["models"],
-    response_model=List[ModelResponse],
-    responses={
-        404: {"description": "Dataset not found"},
-        200: {
-            "description": (
-                "Returns a list of models for the specified dataset"
-            ),
-            "content": {
-                "application/json": {
-                    "example": [
-                        {
-                            "id": 1,
-                            "dataset_id": 12,
-                            "version": 3,
-                            "stage": "production",
-                            "artifact_path": "co2_model_v3.pkl",
-                            "metrics": {"accuracy": 0.95, "f1_score": 0.93},
-                            "parameters": {
-                                "n_estimators": 100,
-                                "max_depth": 10,
-                            },
-                            "description": "CO2 emissions prediction model",
-                            "timestamp": "2024-01-30T12:45:00",
-                            "promotion_timestamp": "2024-02-02T14:10:00",
-                        }
-                    ]
-                }
-            },
-        },
-    },
-)
-def list_models_by_dataset(
-    dataset_name: str,
-    db: Session = Depends(get_db),
-):
-    """
-    List models filtered by dataset.
-
-    **Args**:
-    - dataset_name (str): Name of the dataset to filter models by.
-
-    **Returns**:
-    - (List[ModelResponse]): A list of models associated with the specified
-      dataset.
-    """
-    dataset_entry = (
-        db.query(models.DatasetCatalog)
-        .filter(models.DatasetCatalog.name == dataset_name)
-        .first()
-    )
-    if not dataset_entry:
-        raise HTTPException(status_code=404, detail="Dataset not found")
-
-    models_list = (
-        db.query(models.ModelRegistry)
-        .filter(models.ModelRegistry.dataset_id == dataset_entry.id)
-        .all()
-    )
-
-    return [
-        ModelResponse(
-            id=model.id,
-            dataset_id=model.dataset_id,
-            version=model.version,
-            stage=model.stage,
-            artifact_path=model.artifact_path,
-            metrics=(
-                json.loads(model.metrics)
-                if isinstance(model.metrics, str)
-                else model.metrics
-            ),
-            parameters=(
-                json.loads(model.parameters)
-                if isinstance(model.parameters, str)
-                else model.parameters
-            ),
-            description=model.description,
-            timestamp=model.timestamp,
-            promotion_timestamp=model.promotion_timestamp,
-        )
-        for model in models_list
-    ]
-
-
-@router.get(
-    "/models/by-environment",
-    summary="List models filtered by environment",
-    description=(
-        "Retrieve all models that are currently in a specified environment "
-        "(dev, staging, production)."
-    ),
-    tags=["models"],
-    response_model=List[ModelResponse],
-    responses={
-        400: {"description": "Invalid environment specified"},
-        200: {
-            "description": (
-                "Returns a list of models in the specified environment"
-            ),
-            "content": {
-                "application/json": {
-                    "example": [
-                        {
-                            "id": 1,
-                            "dataset_id": 12,
-                            "version": 3,
-                            "stage": "staging",
-                            "artifact_path": "co2_model_v3.pkl",
-                            "metrics": {"accuracy": 0.95, "f1_score": 0.93},
-                            "parameters": {
-                                "n_estimators": 100,
-                                "max_depth": 10,
-                            },
-                            "description": "CO2 emissions prediction model",
-                            "timestamp": "2024-01-30T12:45:00",
-                            "promotion_timestamp": "2024-02-02T14:10:00",
-                        }
-                    ]
-                }
-            },
-        },
-    },
-)
-def list_models_by_environment(
-    environment: EnvironmentEnum,
-    db: Session = Depends(get_db),
-):
-    """
-    List models filtered by environment.
-
-    **Args**:
-    - environment (EnvironmentEnum): The environment to filter models by
-      (dev, staging, production).
-
-    **Returns**:
-    - (List[ModelResponse]): A list of models deployed in the specified
-      environment.
-    """
-    models_list = (
-        db.query(models.ModelRegistry)
-        .filter(
-            models.ModelRegistry.stage == environment.value
-        )
-        .all()
-    )
-
-    return [
-        ModelResponse(
-            id=model.id,
-            dataset_id=model.dataset_id,
-            version=model.version,
-            stage=model.stage,
-            artifact_path=model.artifact_path,
-            metrics=(
-                json.loads(model.metrics)
-                if isinstance(model.metrics, str)
-                else model.metrics
-            ),
-            parameters=(
-                json.loads(model.parameters)
-                if isinstance(model.parameters, str)
-                else model.parameters
-            ),
-            description=model.description,
-            timestamp=model.timestamp,
-            promotion_timestamp=model.promotion_timestamp,
-        )
-        for model in models_list
-    ]
