@@ -1,22 +1,42 @@
+from importlib import import_module
 import io
 import json
 import logging
-import pickle
 from datetime import datetime
-from importlib import import_module
 from typing import List, Any
 
+import joblib
 import pandas as pd
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Path,
+    Query,
+)
+
 from sqlalchemy.orm import Session
-from sklearn import datasets
-from sklearn.metrics import classification_report, f1_score
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    davies_bouldin_score,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    precision_score,
+    r2_score,
+    recall_score,
+    root_mean_squared_error,
+    silhouette_score,
+)
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 
 from app.db.session import get_db
 from app.db import models
 from app.models.pydantic_models import (
+    PromoteResponse,
+    RemoveResponse,
     TrainRequest,
     TrainResponse,
     ModelResponse,
@@ -26,15 +46,16 @@ from app.models.pydantic_models import (
     RemoveRequest,
     PredictResponse,
 )
-from app.utils.constants import EnvironmentEnum
+from app.utils.constants import MODEL_MAPPING, EnvironmentEnum
 from app.utils.object_storage import (
     delete_object_from_bucket,
     put_object_to_bucket,
     get_object_from_bucket,
     load_dataset_from_storage,
 )
-from app.utils.preprocessing import create_preprocessor, detect_target_column
+from app.utils.preprocessing import create_preprocessor
 from app.config import TRAINED_MODELS_BUCKET
+from app.utils.problem_type import detect_problem_type
 from app.utils.string_utils import extract_model_name
 
 router = APIRouter()
@@ -80,13 +101,35 @@ logger = logging.getLogger(__name__)
                     "example": {
                         "message": "Model trained and registered successfully",
                         "dataset": "co2_emission",
+                        "environment": "dev",
                         "version": 1,
-                        "model_file": "co2_emission_model_dev_v1.pkl",
+                        "features": [
+                            "Model_Year",
+                            "Make",
+                            "Model",
+                            "Vehicle_Class",
+                            "Engine_Size",
+                            "Cylinders",
+                            "Transmission",
+                            "Fuel_Consumption_in_City(L/100 km)",
+                            "Fuel_Consumption_in_City_Hwy(L/100 km)",
+                            "Fuel_Consumption_comb(L/100km)",
+                            "CO2_Emissions",
+                        ],
+                        "model_file": "co2_emission_model_dev_v1.joblib",
                         "metrics": {
-                            "accuracy": 0.95,
-                            "f1_score": 0.93,
-                            "precision": {"0": 0.94, "1": 0.96},
-                            "recall": {"0": 0.92, "1": 0.97},
+                            "accuracy": 0.5240641711229946,
+                            "precision": 0.6390650057529853,
+                            "recall": 0.5240641711229946,
+                            "f1_score": 0.4454557503075632,
+                            "classification_report": {
+                                "1": {
+                                    "precision": 1,
+                                    "recall": 0,
+                                    "f1-score": 0,
+                                    "support": 17,
+                                },
+                            },
                         },
                     }
                 }
@@ -98,115 +141,169 @@ def train_model(
     request_data: TrainRequest,
     db: Session = Depends(get_db),
 ) -> Any:
+    # Input validation and preprocessing
     dataset_name = request_data.dataset_name
-    use_example = request_data.use_example
     target_column = request_data.target_column
-    test_size = request_data.test_size
-    random_state = request_data.random_state
+    test_size = request_data.test_size or 0.2
+    random_state = request_data.random_state or 42
 
     try:
-        model_module = request_data.model["model_module"]
         model_class = request_data.model["model_class"]
         model_params = request_data.model.get("model_params", {})
     except KeyError as e:
-        raise HTTPException(
-            status_code=400, detail=f"Missing key in model configuration: {e}"
-        )
+        raise HTTPException(status_code=400, detail=f"Missing key: {e}")
 
-    if use_example:
-        dataset_name = "co2_emission"
-        iris = datasets.load_iris()
-        df = pd.DataFrame(data=iris.data, columns=iris.feature_names)
-        df["target"] = iris.target
-    else:
-        dataset_entry = (
-            db.query(models.DatasetCatalog)
-            .filter(models.DatasetCatalog.name == dataset_name)
-            .first()
-        )
-        if not dataset_entry:
-            raise HTTPException(status_code=404, detail="Dataset not found")
-        df = load_dataset_from_storage(dataset_entry.location)
-
-    target_column = target_column or detect_target_column(df)
-    if target_column not in df.columns:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Target column '{target_column}' not found in dataset.",
-        )
-
-    X_df = df.drop(columns=[target_column])
-    y = df[target_column]
-    feature_names = X_df.columns.tolist()
-    preprocessor = create_preprocessor(X_df)
+    # Load dataset
+    dataset_entry = (
+        db.query(models.DatasetCatalog)
+        .filter(models.DatasetCatalog.name == dataset_name)
+        .first()
+    )
+    if not dataset_entry:
+        raise HTTPException(status_code=404, detail="Dataset not found")
 
     try:
-        module = import_module(model_module)
+        df = load_dataset_from_storage(dataset_entry.location)
+    except Exception as e:
+        logger.error(f"Failed to load dataset: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load dataset")
+
+    # Determine problem type
+    if target_column is None:
+        problem_type = "unsupervised"
+        X_df = df
+        logger.warning(
+            "⚠️ No target_column provided. Treating as unsupervised learning."
+        )
+    else:
+        if target_column not in df.columns:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Target column '{target_column}' not found in dataset."
+                ),
+            )
+        y = df[target_column]
+        X_df = df.drop(columns=[target_column])
+        problem_type = detect_problem_type(y)
+
+    feature_names = list(X_df.columns)
+
+    # Dynamically import model class
+    module_name = MODEL_MAPPING.get(model_class, "sklearn.ensemble")
+    try:
+        module = import_module(module_name)
         ModelClass = getattr(module, model_class)
         model_instance = ModelClass(**model_params)
     except Exception as e:
         logger.exception(f"Failed to load model: {e}")
         raise HTTPException(
-            status_code=400, detail="Invalid model configuration"
+            status_code=400, detail=f"Invalid model class: {model_class}"
         )
 
+    # Create ML pipeline
+    preprocessor = create_preprocessor(X_df)
     full_pipeline = Pipeline(
         steps=[("preprocessor", preprocessor), ("model", model_instance)]
     )
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_df, y, test_size=test_size, random_state=random_state
-    )
-    full_pipeline.fit(X_train, y_train)
-    y_pred = full_pipeline.predict(X_test)
-    metrics = classification_report(
-        y_test, y_pred, output_dict=True, zero_division=0
-    )
-    metrics["f1_score"] = f1_score(y_test, y_pred, average="weighted")
 
-    if not use_example:
-        existing_versions = (
-            db.query(models.ModelRegistry)
-            .filter(models.ModelRegistry.dataset_id == dataset_entry.id)
-            .all()
+    # Train model and calculate metrics
+    metrics = {}
+    if problem_type in ["classification", "regression"]:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_df, y, test_size=test_size, random_state=random_state
         )
-        version = (
-            max([entry.version for entry in existing_versions], default=0) + 1
-        )
+        try:
+            full_pipeline.fit(X_train, y_train)
+            y_pred = full_pipeline.predict(X_test)
+        except Exception as e:
+            logger.error(f"Model training failed: {e}")
+            raise HTTPException(
+                status_code=500, detail="Model training failed"
+            )
+
+        if problem_type == "classification":
+            metrics["accuracy"] = accuracy_score(y_test, y_pred)
+            metrics["precision"] = precision_score(
+                y_test, y_pred, average="weighted", zero_division=1
+            )
+            metrics["recall"] = recall_score(
+                y_test, y_pred, average="weighted", zero_division=1
+            )
+            metrics["f1_score"] = f1_score(y_test, y_pred, average="weighted")
+            metrics["classification_report"] = classification_report(
+                y_test, y_pred, output_dict=True, zero_division=1
+            )
+        elif problem_type == "regression":
+            metrics["MAE"] = mean_absolute_error(y_test, y_pred)
+            metrics["MSE"] = mean_squared_error(y_test, y_pred)
+            metrics["RMSE"] = root_mean_squared_error(y_test, y_pred)
+            metrics["R2_Score"] = r2_score(y_test, y_pred)
     else:
-        version = 1
+        try:
+            full_pipeline.fit(X_df)
+        except Exception as e:
+            logger.error(f"Model training failed: {e}")
+            raise HTTPException(
+                status_code=500, detail="Model training failed"
+            )
+
+        if model_class == "KMeans":
+            y_pred = full_pipeline.named_steps["model"].labels_
+            metrics["silhouette_score"] = silhouette_score(X_df, y_pred)
+            metrics["davies_bouldin_score"] = davies_bouldin_score(
+                X_df, y_pred
+            )
+        elif model_class == "IsolationForest":
+            y_pred = full_pipeline.named_steps["model"].predict(X_df)
+            metrics["anomalies_detected"] = int((y_pred == -1).sum())
+
+    # Save and register the model
+    existing_versions = (
+        db.query(models.ModelRegistry)
+        .filter(models.ModelRegistry.dataset_id == dataset_entry.id)
+        .all()
+    )
+    version = (
+        max([entry.version for entry in existing_versions], default=0) + 1
+    )
 
     environment = "dev"
-    model_file_name = f"{dataset_name}_model_{environment}_v{version}.pkl"
+    model_file_name = f"{dataset_name}_model_{environment}_v{version}.joblib"
     model_data = io.BytesIO()
-    pickle.dump(full_pipeline, model_data)
+    joblib.dump(full_pipeline, model_data)
     model_data.seek(0)
     put_object_to_bucket(
         TRAINED_MODELS_BUCKET, model_file_name, model_data.getvalue()
     )
 
-    if not use_example:
-        model_params["feature_names"] = feature_names
-        new_registry_entry = models.ModelRegistry(
-            dataset_id=dataset_entry.id,
-            version=version,
-            environment=environment,
-            artifact_path=model_file_name,
-            metrics=json.dumps(metrics),
-            parameters=json.dumps(model_params),
-            description="Model trained automatically",
-            promotion_timestamp=None,
-        )
-        db.add(new_registry_entry)
-        db.commit()
-        db.refresh(new_registry_entry)
+    new_registry_entry = models.ModelRegistry(
+        dataset_id=dataset_entry.id,
+        version=version,
+        environment=environment,
+        artifact_path=model_file_name,
+        metrics=json.dumps(metrics),
+        parameters=json.dumps(model_params),
+        target_column=target_column,
+        feature_names=json.dumps(feature_names),
+        description="Model trained automatically",
+        promotion_timestamp=None,
+    )
 
-    return {
-        "message": "Model trained and registered successfully",
-        "dataset": dataset_name,
-        "version": version,
-        "model_file": model_file_name,
-        "metrics": metrics,
-    }
+    db.add(new_registry_entry)
+    db.commit()
+    db.refresh(new_registry_entry)
+
+    return TrainResponse(
+        message="Model trained and registered successfully",
+        model_file=model_file_name,
+        dataset=dataset_name,
+        environment=environment,
+        version=version,
+        target=target_column,
+        features=feature_names,
+        metrics=metrics,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -308,12 +405,14 @@ def promote_model(
     entry.promotion_timestamp = datetime.now()
     db.commit()
     db.refresh(entry)
-    return {
-        "message": f"Model promoted to {environment} successfully",
-        "dataset": dataset_name,
-        "version": version,
-        "model_file": new_model_file,
-    }
+    return PromoteResponse(
+        message=f"Model promoted to {environment} successfully",
+        model_name=extract_model_name(new_model_file),
+        dataset=dataset_name,
+        version=version,
+        environment=environment,
+        promoted_at=entry.promotion_timestamp,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -345,14 +444,18 @@ def promote_model(
         },
     },
 )
-def predict(
-    request_data: PredictRequest,
-    db: Session = Depends(get_db),
-):
+@router.post(
+    "/predict",
+    summary="Make predictions using a deployed model",
+    tags=["models"],
+)
+def predict(request_data: PredictRequest, db: Session = Depends(get_db)):
     dataset_name = request_data.dataset_name
     environment = request_data.environment.lower()
-    input_features = request_data.features
+    input_features = request_data.features  # List of dictionaries
+    version = request_data.version  # Optional: Specify version
 
+    # Load dataset entry from DB
     dataset_entry = (
         db.query(models.DatasetCatalog)
         .filter(models.DatasetCatalog.name == dataset_name)
@@ -361,31 +464,79 @@ def predict(
     if not dataset_entry:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    entry = (
-        db.query(models.ModelRegistry)
-        .filter(
-            models.ModelRegistry.dataset_id == dataset_entry.id,
-            models.ModelRegistry.environment
-            == environment,  # Updated property name
-        )
-        .order_by(models.ModelRegistry.version.desc())
-        .first()
+    # Query model registry for the specific version (if provided) or latest
+    query = db.query(models.ModelRegistry).filter(
+        models.ModelRegistry.dataset_id == dataset_entry.id,
+        models.ModelRegistry.environment == environment,
     )
+
+    if version:
+        query = query.filter(models.ModelRegistry.version == version)
+
+    query = query.order_by(models.ModelRegistry.version.desc())
+    entry = query.first()
+
     if not entry:
         raise HTTPException(
-            status_code=404, detail="No model found for the given environment"
+            status_code=404,
+            detail="No model found for the given environment and version",
         )
 
-    model_response = get_object_from_bucket(
-        TRAINED_MODELS_BUCKET, entry.artifact_path
-    )
-    model_pipeline = pickle.loads(model_response["Body"].read())
+    # Load model from object storage
+    try:
+        model_response = get_object_from_bucket(
+            TRAINED_MODELS_BUCKET, entry.artifact_path
+        )
+        model_pipeline = joblib.load(io.BytesIO(model_response["Body"].read()))
+    except Exception as e:
+        logger.error(f"Failed to load model: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load model")
+
+    # Load feature names from the model registry
+    feature_names = json.loads(entry.feature_names)
+
+    # Convert input features to DataFrame
     input_df = pd.DataFrame(input_features)
-    params = json.loads(entry.parameters)
-    if "feature_names" in params:
-        input_df.columns = params["feature_names"]
-    predictions = model_pipeline.predict(input_df)
-    return {"predictions": predictions.tolist()}
+
+    # Ensure all required features are present
+    missing_features = set(feature_names) - set(input_df.columns)
+    if missing_features:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing features in input: {missing_features}",
+        )
+
+    # Ensure no extra features are provided
+    extra_features = set(input_df.columns) - set(feature_names)
+    if extra_features:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Extra features provided: {extra_features}",
+        )
+
+    # Reorder columns to match training data
+    input_df = input_df[feature_names]
+
+    # Ensure consistent data types
+    for column in input_df.columns:
+        if (
+            input_df[column].dtype == object
+        ):  # Convert object (string) columns to categorical
+            input_df[column] = input_df[column].astype("category")
+
+    # Get predictions
+    try:
+        predictions = model_pipeline.predict(input_df).tolist()
+    except Exception as e:
+        logger.error(f"Prediction failed: {e}")
+        raise HTTPException(status_code=500, detail="Prediction failed")
+
+    return PredictResponse(
+        dataset=dataset_name,
+        environment=environment,
+        version=entry.version,
+        predictions=predictions,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -405,16 +556,26 @@ def predict(
                     "example": [
                         {
                             "id": 1,
-                            "dataset_id": 1,
+                            "name": "co2_emission_model_production_v1",
                             "version": 1,
-                            "environment": "dev",
-                            "artifact_path": "co2_emission_model_dev_v1.pkl",
-                            "metrics": {"accuracy": 0.95, "f1_score": 0.93},
-                            "parameters": {"n_estimators": 100},
-                            "description": "Trained model",
-                            "timestamp": "2024-01-01T12:00:00",
-                            "promotion_timestamp": None,
-                        }
+                            "environment": "production",
+                            "dataset_name": "co2_emission",
+                            "features": [
+                                "Model_Year",
+                                "Make",
+                                "Model",
+                                "Vehicle_Class",
+                                "Engine_Size",
+                                "Cylinders",
+                                "Transmission",
+                                "Fuel_Consumption_in_City(L/100 km)",
+                                "Fuel_Consumption_in_City_Hwy(L/100 km)",
+                                "Fuel_Consumption_comb(L/100km)",
+                                "CO2_Emissions",
+                            ],
+                            "trained_at": "2025-02-03T22:17:26",
+                            "promoted_at": "2025-02-03T22:18:05",
+                        },
                     ]
                 }
             },
@@ -422,7 +583,28 @@ def predict(
     },
 )
 def list_models(db: Session = Depends(get_db)):
-    return db.query(models.ModelRegistry).all()
+    models_list = db.query(models.ModelRegistry).all()
+
+    return [
+        ModelResponse(
+            id=model.id,
+            name=extract_model_name(model.artifact_path),
+            version=model.version,
+            environment=model.environment,
+            dataset_name=db.query(models.DatasetCatalog)
+            .filter(models.DatasetCatalog.id == model.dataset_id)
+            .first()
+            .name,
+            features=json.loads(model.feature_names),
+            trained_at=model.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            promoted_at=(
+                model.promotion_timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                if model.promotion_timestamp
+                else model.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            ),
+        )
+        for model in models_list
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -450,15 +632,26 @@ def list_models(db: Session = Depends(get_db)):
                     "example": [
                         {
                             "id": 1,
-                            "name": "co2_emission_model_dev_v1",
+                            "name": "co2_emission_model_production_v1",
                             "version": 1,
-                            "environment": "dev",
+                            "environment": "production",
                             "dataset_name": "co2_emission",
-                            "f1_score": 0.93,
-                            "accuracy": 0.95,
-                            "trained_at": "2024-01-01 12:00:00",
-                            "promoted_at": None,
-                        }
+                            "features": [
+                                "Model_Year",
+                                "Make",
+                                "Model",
+                                "Vehicle_Class",
+                                "Engine_Size",
+                                "Cylinders",
+                                "Transmission",
+                                "Fuel_Consumption_in_City(L/100 km)",
+                                "Fuel_Consumption_in_City_Hwy(L/100 km)",
+                                "Fuel_Consumption_comb(L/100km)",
+                                "CO2_Emissions",
+                            ],
+                            "trained_at": "2025-02-03T22:17:26",
+                            "promoted_at": "2025-02-03T22:18:05",
+                        },
                     ]
                 }
             },
@@ -466,7 +659,7 @@ def list_models(db: Session = Depends(get_db)):
     },
 )
 def list_models_by_dataset(
-    dataset_name: str,
+    dataset_name: str = Query(..., example="co2_emission"),
     db: Session = Depends(get_db),
 ):
     dataset_entry = (
@@ -486,23 +679,14 @@ def list_models_by_dataset(
             id=model.id,
             name=extract_model_name(model.artifact_path),
             version=model.version,
-            environment=model.environment,  # Updated property name
+            environment=model.environment,
             dataset_name=dataset_name,
-            f1_score=(
-                json.loads(model.metrics).get("f1_score")
-                if isinstance(model.metrics, str)
-                else model.metrics.get("f1_score")
-            ),
-            accuracy=(
-                json.loads(model.metrics).get("accuracy")
-                if isinstance(model.metrics, str)
-                else model.metrics.get("accuracy")
-            ),
+            features=json.loads(model.feature_names),
             trained_at=model.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
             promoted_at=(
                 model.promotion_timestamp.strftime("%Y-%m-%d %H:%M:%S")
                 if model.promotion_timestamp
-                else None
+                else model.timestamp.strftime("%Y-%m-%d %H:%M:%S")
             ),
         )
         for model in models_list
@@ -533,15 +717,26 @@ def list_models_by_dataset(
                 "application/json": {
                     "example": [
                         {
-                            "id": 1,
-                            "name": "co2_emission_model_dev_v1",
-                            "version": 1,
-                            "environment": "dev",
+                            "id": 2,
+                            "name": "co2_emission_model_staging_v2",
+                            "version": 2,
+                            "environment": "staging",
                             "dataset_name": "co2_emission",
-                            "f1_score": 0.93,
-                            "accuracy": 0.95,
-                            "trained_at": "2024-01-01 12:00:00",
-                            "promoted_at": None,
+                            "features": [
+                                "Model_Year",
+                                "Make",
+                                "Model",
+                                "Vehicle_Class",
+                                "Engine_Size",
+                                "Cylinders",
+                                "Transmission",
+                                "Fuel_Consumption_in_City(L/100 km)",
+                                "Fuel_Consumption_in_City_Hwy(L/100 km)",
+                                "Fuel_Consumption_comb(L/100km)",
+                                "CO2_Emissions",
+                            ],
+                            "trained_at": "2025-02-03T22:47:36",
+                            "promoted_at": "2025-02-03T22:51:05",
                         }
                     ]
                 }
@@ -555,10 +750,7 @@ def list_models_by_environment(
 ):
     models_list = (
         db.query(models.ModelRegistry)
-        .filter(
-            models.ModelRegistry.environment
-            == environment.value  # Updated property name
-        )
+        .filter(models.ModelRegistry.environment == environment.value)
         .all()
     )
     return [
@@ -566,22 +758,18 @@ def list_models_by_environment(
             id=model.id,
             name=extract_model_name(model.artifact_path),
             version=model.version,
-            environment=model.environment,  # Updated property name
+            environment=model.environment,
             dataset_name=db.query(models.DatasetCatalog)
             .filter(models.DatasetCatalog.id == model.dataset_id)
             .first()
             .name,
-            f1_score=(
-                json.loads(model.metrics).get("f1_score")
-                if isinstance(model.metrics, str)
-                else model.metrics.get("f1_score")
-            ),
-            accuracy=(
-                json.loads(model.metrics).get("accuracy")
-                if isinstance(model.metrics, str)
-                else model.metrics.get("accuracy")
-            ),
+            features=json.loads(model.feature_names),
             trained_at=model.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            promoted_at=(
+                model.promotion_timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                if model.promotion_timestamp
+                else model.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            ),
         )
         for model in models_list
     ]
@@ -614,16 +802,74 @@ def list_models_by_environment(
                         "environment": "dev",
                         "dataset_name": "co2_emission",
                         "artifact_path": "co2_emission_model_dev_v1.pkl",
+                        "features": [
+                            "Model_Year",
+                            "Make",
+                            "Model",
+                            "Vehicle_Class",
+                            "Engine_Size",
+                            "Cylinders",
+                            "Transmission",
+                            "Fuel_Consumption_in_City(L/100 km)",
+                            "Fuel_Consumption_in_City_Hwy(L/100 km)",
+                            "Fuel_Consumption_comb(L/100km)",
+                            "CO2_Emissions",
+                        ],
                         "metrics": {
-                            "accuracy": 0.95,
-                            "f1_score": 0.93,
-                            "precision": {"0": 0.94, "1": 0.96},
-                            "recall": {"0": 0.92, "1": 0.97},
+                            "accuracy": 0.5240641711229946,
+                            "precision": 0.6390650057529853,
+                            "recall": 0.5240641711229946,
+                            "f1_score": 0.4454557503075632,
+                            "classification_report": {
+                                "1": {
+                                    "precision": 1,
+                                    "recall": 0,
+                                    "f1-score": 0,
+                                    "support": 17,
+                                },
+                                "3": {
+                                    "precision": 0.5416666666666666,
+                                    "recall": 0.3333333333333333,
+                                    "f1-score": 0.4126984126984127,
+                                    "support": 39,
+                                },
+                                "5": {
+                                    "precision": 0.48717948717948717,
+                                    "recall": 0.8507462686567164,
+                                    "f1-score": 0.6195652173913043,
+                                    "support": 67,
+                                },
+                                "6": {
+                                    "precision": 1,
+                                    "recall": 0,
+                                    "f1-score": 0,
+                                    "support": 25,
+                                },
+                                "7": {
+                                    "precision": 0.6086956521739131,
+                                    "recall": 0.717948717948718,
+                                    "f1-score": 0.6588235294117647,
+                                    "support": 39,
+                                },
+                                "accuracy": 0.5240641711229946,
+                                "macro avg": {
+                                    "precision": 0.7275083612040134,
+                                    "recall": 0.3804056639877535,
+                                    "f1-score": 0.33821743190029635,
+                                    "support": 187,
+                                },
+                                "weighted avg": {
+                                    "precision": 0.6390650057529853,
+                                    "recall": 0.5240641711229946,
+                                    "f1-score": 0.4454557503075632,
+                                    "support": 187,
+                                },
+                            },
                         },
-                        "parameters": {"n_estimators": 100},
-                        "description": "Trained model",
-                        "trained_at": "2024-01-01 12:00:00",
-                        "promoted_at": None,
+                        "parameters": {"max_depth": 5, "n_estimators": 100},
+                        "description": "Model trained automatically",
+                        "trained_at": "2025-02-03T22:17:26",
+                        "promoted_at": "2025-02-03T22:18:05",
                     }
                 }
             },
@@ -631,7 +877,7 @@ def list_models_by_environment(
     },
 )
 def get_model_by_id(
-    model_id: int,
+    model_id: int = Path(..., example=1),
     db: Session = Depends(get_db),
 ):
     model = (
@@ -665,11 +911,12 @@ def get_model_by_id(
             else model.parameters
         ),
         description=model.description,
+        features=json.loads(model.feature_names),
         trained_at=model.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
         promoted_at=(
             model.promotion_timestamp.strftime("%Y-%m-%d %H:%M:%S")
             if model.promotion_timestamp
-            else None
+            else model.timestamp.strftime("%Y-%m-%d %H:%M:%S")
         ),
     )
 
@@ -711,12 +958,12 @@ def get_model_by_id(
                 "application/json": {
                     "example": {
                         "message": (
-                            "Model version 1 removed successfully from "
-                            "staging"
+                            "Model version 2 removed successfully from staging"
                         ),
                         "dataset": "co2_emission",
-                        "version": 1,
+                        "version": 2,
                         "environment": "staging",
+                        "removed_at": "2025-02-03T22:55:03.020978",
                     }
                 }
             },
@@ -764,12 +1011,12 @@ def remove_model(
     db.delete(entry)
     db.commit()
 
-    return {
-        "message": (
-            f"Model version {version} removed successfully from "
-            f"{environment}"
+    return RemoveResponse(
+        message=(
+            f"Model version {version} removed successfully from {environment}"
         ),
-        "dataset": dataset_name,
-        "version": version,
-        "environment": environment,
-    }
+        dataset=dataset_name,
+        version=version,
+        environment=environment,
+        removed_at=datetime.now(),
+    )
