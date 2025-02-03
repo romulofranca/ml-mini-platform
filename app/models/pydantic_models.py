@@ -1,6 +1,6 @@
 from typing import Any, List, Optional, Dict
 from datetime import datetime
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+from pydantic import BaseModel, Field, field_validator
 import json
 
 
@@ -10,21 +10,24 @@ class DatasetResponse(BaseModel):
     description: str = Field(..., example="CO2 Emission dataset")
     location: str = Field(..., example="s3://bucket/co2_emission.csv")
     created_at: datetime = Field(..., example="2024-01-01T12:00:00")
-    model_config = ConfigDict(from_attributes=True)
+
+
+class DeleteDatasetResponse(BaseModel):
+    message: str = Field(..., example="Dataset deleted successfully")
+    dataset: str = Field(..., example="co2_emission")
+    deleted_at: datetime = Field(..., example="2024-01-01T12:00:00")
 
 
 class TrainRequest(BaseModel):
     dataset_name: str = Field(..., example="co2_emission")
-    use_example: bool = Field(False, example=False)
     model: Dict[str, Any] = Field(
         ...,
         example={
-            "model_module": "sklearn.ensemble",
             "model_class": "RandomForestClassifier",
             "model_params": {"n_estimators": 100, "max_depth": 5},
         },
     )
-    target_column: Optional[str] = Field(None, example="target")
+    target_column: Optional[str] = Field(None, example="Smog_Level")
     test_size: Optional[float] = Field(0.2, example=0.2)
     random_state: Optional[int] = Field(42, example=42)
 
@@ -34,7 +37,10 @@ class TrainResponse(BaseModel):
         ..., example="Model trained and registered successfully"
     )
     dataset: str = Field(..., example="co2_emission")
+    environment: str = Field(..., example="dev")
     version: int = Field(..., example=1)
+    target: str = Field(..., example="Smog_Level")
+    features: List[str] = Field(..., example=["CO2", "Temperature", "Traffic"])
     model_file: str = Field(..., example="co2_emission_model_dev_v1.pkl")
     metrics: Dict[str, Any] = Field(default_factory=dict)
 
@@ -51,8 +57,7 @@ class ModelResponse(BaseModel):
     version: int = Field(..., example=1)
     environment: str = Field(..., example="dev")
     dataset_name: str = Field(..., example="co2_emission")
-    f1_score: Optional[float] = Field(None, example=0.93)
-    accuracy: Optional[float] = Field(None, example=0.95)
+    features: List[str] = Field(..., example=["CO2", "Temperature", "Traffic"])
     trained_at: datetime = Field(..., example="2024-01-01T12:00:00")
     promoted_at: Optional[datetime] = Field(
         None, example="2024-01-02T12:00:00"
@@ -66,6 +71,7 @@ class ModelDetailResponse(BaseModel):
     environment: str = Field(..., example="dev")
     dataset_name: str = Field(..., example="co2_emission")
     artifact_path: str = Field(..., example="co2_emission_model_dev_v1.pkl")
+    features: List[str] = Field(..., example=["CO2", "Temperature", "Traffic"])
     metrics: Dict[str, Any] = Field(
         ...,
         example={
@@ -103,6 +109,15 @@ class PromoteRequest(BaseModel):
     )
 
 
+class PromoteResponse(BaseModel):
+    message: str = Field(..., example="Model promoted successfully")
+    model_name: str = Field(..., example="co2_emission_model_dev_v1")
+    dataset: str = Field(..., example="co2_emission")
+    version: int = Field(..., example=1)
+    environment: str = Field(..., example="production")
+    promoted_at: datetime = Field(..., example="2024-01-01T12:00:00")
+
+
 class PredictRequest(BaseModel):
     dataset_name: str = Field(
         ..., example="co2_emission", description="Dataset/model family name"
@@ -112,14 +127,44 @@ class PredictRequest(BaseModel):
         example="production",
         description="Environment from which to load the model",
     )
-    features: List[List[float]] = Field(
+    version: int = Field(..., example=1, description="Model version to use")
+    features: List[Dict[str, float | int | str]] = Field(
         ...,
-        example=[[120.5, 75.3, 1], [145.2, 80.1, 0]],
-        description="2D list of feature values for prediction",
+        example=[
+            {
+                "Model_Year": 2015,
+                "Make": "Toyota",
+                "Model": "Corolla",
+                "Vehicle_Class": "Compact",
+                "Engine_Size": 1.8,
+                "Cylinders": 4,
+                "Transmission": "Automatic",
+                "Fuel_Consumption_in_City(L/100 km)": 8.5,
+                "Fuel_Consumption_in_City_Hwy(L/100 km)": 6.5,
+                "Fuel_Consumption_comb(L/100km)": 7.5,
+                "CO2_Emissions": 150,
+            },
+            {
+                "Model_Year": 2020,
+                "Make": "Honda",
+                "Model": "Civic",
+                "Vehicle_Class": "Compact",
+                "Engine_Size": 2.0,
+                "Cylinders": 4,
+                "Transmission": "Manual",
+                "Fuel_Consumption_in_City(L/100 km)": 9.0,
+                "Fuel_Consumption_in_City_Hwy(L/100 km)": 6.0,
+                "Fuel_Consumption_comb(L/100km)": 7.0,
+                "CO2_Emissions": 140,
+            },
+        ],
     )
 
 
 class PredictResponse(BaseModel):
+    dataset: str = Field(..., example="co2_emission")
+    environment: str = Field(..., example="production")
+    version: int = Field(..., example=1)
     predictions: List[int] = Field(
         ..., example=[0, 1, 1], description="Predicted target values"
     )
@@ -135,3 +180,11 @@ class RemoveRequest(BaseModel):
         example="staging",
         description="Environment where the model is stored",
     )
+
+
+class RemoveResponse(BaseModel):
+    message: str = Field(..., example="Model removed successfully")
+    dataset: str = Field(..., example="co2_emission")
+    version: int = Field(..., example=1)
+    environment: str = Field(..., example="staging")
+    removed_at: datetime = Field(..., example="2024-01-01T12:00:00")
