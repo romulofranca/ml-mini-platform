@@ -7,3 +7,12 @@ class EnvironmentEnum(str, Enum):
     dev = "dev"
     staging = "staging"
     production = "production"
+
+
+MODEL_MAPPING = {
+    "KMeans": "sklearn.cluster",
+    "DBSCAN": "sklearn.cluster",
+    "IsolationForest": "sklearn.ensemble",
+    "LinearRegression": "sklearn.linear_model",
+    "DecisionTreeClassifier": "sklearn.tree",
+}
