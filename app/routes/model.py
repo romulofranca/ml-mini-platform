@@ -277,6 +277,8 @@ def train_model(
         TRAINED_MODELS_BUCKET, model_file_name, model_data.getvalue()
     )
 
+    feature_names = list(df.columns.drop("Id"))
+
     new_registry_entry = models.ModelRegistry(
         dataset_id=dataset_entry.id,
         version=version,
