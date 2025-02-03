@@ -20,11 +20,11 @@ from app.models.pydantic_models import (
     TrainRequest,
     TrainResponse,
     ModelResponse,
-    ModelListResponse,
     ModelDetailResponse,
     PromoteRequest,
     PredictRequest,
     RemoveRequest,
+    PredictResponse,
 )
 from app.utils.constants import EnvironmentEnum
 from app.utils.object_storage import (
@@ -50,7 +50,9 @@ logger = logging.getLogger(__name__)
     description=(
         "Trains a new machine learning model using the specified dataset, "
         "target column, and model configuration. The trained model is then "
-        "stored in object storage and registered in the database."
+        "stored in object storage and registered in the database. "
+        "If no target column is provided, the latest column of the dataset "
+        "is used."
     ),
     tags=["models"],
     response_model=TrainResponse,
@@ -112,7 +114,7 @@ def train_model(
         )
 
     if use_example:
-        dataset_name = "iris_sample"
+        dataset_name = "co2_emission"
         iris = datasets.load_iris()
         df = pd.DataFrame(data=iris.data, columns=iris.feature_names)
         df["target"] = iris.target
@@ -187,7 +189,7 @@ def train_model(
         new_registry_entry = models.ModelRegistry(
             dataset_id=dataset_entry.id,
             version=version,
-            environment=environment,  # Updated property name
+            environment=environment,
             artifact_path=model_file_name,
             metrics=json.dumps(metrics),
             parameters=json.dumps(model_params),
@@ -325,6 +327,7 @@ def promote_model(
         "(dev, staging, or production)."
     ),
     tags=["models"],
+    response_model=PredictResponse,
     responses={
         404: {
             "description": "Dataset or model not found",
@@ -430,7 +433,7 @@ def list_models(db: Session = Depends(get_db)):
     summary="List models for a specific dataset",
     description="Retrieve all models associated with a specific dataset.",
     tags=["models"],
-    response_model=List[ModelListResponse],
+    response_model=List[ModelResponse],
     responses={
         404: {
             "description": "Dataset not found",
@@ -479,7 +482,7 @@ def list_models_by_dataset(
         .all()
     )
     return [
-        ModelListResponse(
+        ModelResponse(
             id=model.id,
             name=extract_model_name(model.artifact_path),
             version=model.version,
@@ -514,7 +517,7 @@ def list_models_by_dataset(
     summary="List models by environment",
     description="Retrieve all models in a specific environment.",
     tags=["models"],
-    response_model=List[ModelListResponse],
+    response_model=List[ModelResponse],
     responses={
         400: {
             "description": "Invalid environment specified",
@@ -559,7 +562,7 @@ def list_models_by_environment(
         .all()
     )
     return [
-        ModelListResponse(
+        ModelResponse(
             id=model.id,
             name=extract_model_name(model.artifact_path),
             version=model.version,
@@ -741,8 +744,7 @@ def remove_model(
         .filter(
             models.ModelRegistry.dataset_id == dataset_entry.id,
             models.ModelRegistry.version == version,
-            models.ModelRegistry.environment
-            == environment,
+            models.ModelRegistry.environment == environment,
         )
         .first()
     )
