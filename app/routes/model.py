@@ -446,11 +446,6 @@ def promote_model(
         },
     },
 )
-@router.post(
-    "/predict",
-    summary="Make predictions using a deployed model",
-    tags=["models"],
-)
 def predict(request_data: PredictRequest, db: Session = Depends(get_db)):
     dataset_name = request_data.dataset_name
     environment = request_data.environment.lower()
