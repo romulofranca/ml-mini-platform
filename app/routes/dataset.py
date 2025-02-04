@@ -8,7 +8,10 @@ from app.db import models
 from app.utils.string_utils import normalize_dataset_name
 from app.config import DATASETS_BUCKET
 from app.utils.object_storage import object_storage_client
-from app.models.pydantic_models import DatasetResponse, DeleteDatasetResponse
+from app.models.pydantic_models import (
+    DatasetResponse,
+    RemoveDatasetResponse,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -47,17 +50,19 @@ logger = logging.getLogger(__name__)
 )
 def upload_dataset(
     file: UploadFile = File(...),
+    name: Optional[str] = Form("iris_dataset"),
     description: Optional[str] = Form(
         "A sample dataset", description="Dataset description"
     ),
     db: Session = Depends(get_db),
 ) -> DatasetResponse:
 
-    normalized_name = normalize_dataset_name(file.filename)
+    if not name:
+        name = normalize_dataset_name(file.filename)
 
     existing = (
         db.query(models.DatasetCatalog)
-        .filter(models.DatasetCatalog.name == normalized_name)
+        .filter(models.DatasetCatalog.name == name)
         .first()
     )
     if existing:
@@ -65,7 +70,7 @@ def upload_dataset(
             status_code=400, detail="A dataset with this name already exists."
         )
 
-    file.filename = normalized_name
+    file.filename = name
 
     file_content = file.file.read()
     object_storage_client.put_object(
@@ -73,7 +78,7 @@ def upload_dataset(
     )
 
     new_dataset = models.DatasetCatalog(
-        name=normalized_name,
+        name=name,
         description=description or "",
         location=file.filename,
     )
@@ -81,9 +86,7 @@ def upload_dataset(
     db.commit()
     db.refresh(new_dataset)
 
-    logger.info(
-        f"Dataset '{normalized_name}' has been uploaded and cataloged."
-    )
+    logger.info(f"Dataset '{name}' has been uploaded and cataloged.")
     return DatasetResponse(
         id=new_dataset.id,
         name=new_dataset.name,
@@ -146,8 +149,20 @@ def list_datasets(db: Session = Depends(get_db)) -> List[DatasetResponse]:
         "Delete a dataset entry from the catalog if no related models exist."
     ),
     tags=["datasets"],
-    response_model=dict,
+    response_model=RemoveDatasetResponse,
     responses={
+        200: {
+            "description": "Details about the deleted dataset",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "message": "Dataset deleted successfully",
+                        "dataset": "my_dataset",
+                        "deleted_at": "2025-02-02T15:42:57",
+                    }
+                }
+            },
+        },
         204: {"description": "Dataset deleted successfully"},
         404: {"description": "Dataset not found"},
         400: {"description": "Cannot delete dataset with existing models"},
@@ -178,7 +193,7 @@ def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
     db.delete(dataset)
     db.commit()
     logger.info(f"Dataset '{dataset.name}' has been deleted.")
-    response_data = DeleteDatasetResponse(
+    response_data = RemoveDatasetResponse(
         message="Dataset deleted successfully",
         dataset=dataset.name,
         deleted_at=datetime.now(),

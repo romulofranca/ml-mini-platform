@@ -100,34 +100,53 @@ logger = logging.getLogger(__name__)
                 "application/json": {
                     "example": {
                         "message": "Model trained and registered successfully",
-                        "dataset": "co2_emission",
+                        "dataset": "iris_dataset",
                         "environment": "dev",
                         "version": 1,
+                        "target": "Species",
                         "features": [
-                            "Model_Year",
-                            "Make",
-                            "Model",
-                            "Vehicle_Class",
-                            "Engine_Size",
-                            "Cylinders",
-                            "Transmission",
-                            "Fuel_Consumption_in_City(L/100 km)",
-                            "Fuel_Consumption_in_City_Hwy(L/100 km)",
-                            "Fuel_Consumption_comb(L/100km)",
-                            "CO2_Emissions",
+                            "SepalLengthCm",
+                            "SepalWidthCm",
+                            "PetalLengthCm",
+                            "PetalWidthCm",
                         ],
-                        "model_file": "co2_emission_model_dev_v1.joblib",
+                        "model_file": "iris_dataset_model_dev_v1.joblib",
                         "metrics": {
-                            "accuracy": 0.5240641711229946,
-                            "precision": 0.6390650057529853,
-                            "recall": 0.5240641711229946,
-                            "f1_score": 0.4454557503075632,
+                            "accuracy": 1,
+                            "precision": 1,
+                            "recall": 1,
+                            "f1_score": 1,
                             "classification_report": {
-                                "1": {
+                                "Iris-setosa": {
                                     "precision": 1,
-                                    "recall": 0,
-                                    "f1-score": 0,
-                                    "support": 17,
+                                    "recall": 1,
+                                    "f1-score": 1,
+                                    "support": 10,
+                                },
+                                "Iris-versicolor": {
+                                    "precision": 1,
+                                    "recall": 1,
+                                    "f1-score": 1,
+                                    "support": 9,
+                                },
+                                "Iris-virginica": {
+                                    "precision": 1,
+                                    "recall": 1,
+                                    "f1-score": 1,
+                                    "support": 11,
+                                },
+                                "accuracy": 1,
+                                "macro avg": {
+                                    "precision": 1,
+                                    "recall": 1,
+                                    "f1-score": 1,
+                                    "support": 30,
+                                },
+                                "weighted avg": {
+                                    "precision": 1,
+                                    "recall": 1,
+                                    "f1-score": 1,
+                                    "support": 30,
                                 },
                             },
                         },
@@ -141,7 +160,6 @@ def train_model(
     request_data: TrainRequest,
     db: Session = Depends(get_db),
 ) -> Any:
-    # Input validation and preprocessing
     dataset_name = request_data.dataset_name
     target_column = request_data.target_column
     test_size = request_data.test_size or 0.2
@@ -168,7 +186,9 @@ def train_model(
         logger.error(f"Failed to load dataset: {e}")
         raise HTTPException(status_code=500, detail="Failed to load dataset")
 
-    # Determine problem type
+    if "Id" in df.columns:
+        df = df.drop(columns=["Id"])
+
     if target_column is None:
         problem_type = "unsupervised"
         X_df = df
@@ -189,7 +209,6 @@ def train_model(
 
     feature_names = list(X_df.columns)
 
-    # Dynamically import model class
     module_name = MODEL_MAPPING.get(model_class, "sklearn.ensemble")
     try:
         module = import_module(module_name)
@@ -201,13 +220,11 @@ def train_model(
             status_code=400, detail=f"Invalid model class: {model_class}"
         )
 
-    # Create ML pipeline
     preprocessor = create_preprocessor(X_df)
     full_pipeline = Pipeline(
         steps=[("preprocessor", preprocessor), ("model", model_instance)]
     )
 
-    # Train model and calculate metrics
     metrics = {}
     if problem_type in ["classification", "regression"]:
         X_train, X_test, y_train, y_test = train_test_split(
@@ -258,7 +275,6 @@ def train_model(
             y_pred = full_pipeline.named_steps["model"].predict(X_df)
             metrics["anomalies_detected"] = int((y_pred == -1).sum())
 
-    # Save and register the model
     existing_versions = (
         db.query(models.ModelRegistry)
         .filter(models.ModelRegistry.dataset_id == dataset_entry.id)
@@ -276,8 +292,6 @@ def train_model(
     put_object_to_bucket(
         TRAINED_MODELS_BUCKET, model_file_name, model_data.getvalue()
     )
-
-    feature_names = list(df.columns.drop("Id"))
 
     new_registry_entry = models.ModelRegistry(
         dataset_id=dataset_entry.id,
@@ -347,9 +361,11 @@ def train_model(
                 "application/json": {
                     "example": {
                         "message": "Model promoted to production successfully",
-                        "dataset": "co2_emission",
+                        "model_name": "iris_dataset_model_production_v1",
+                        "dataset": "iris_dataset",
                         "version": 1,
-                        "model_file": "co2_emission_model_production_v1.pkl",
+                        "environment": "production",
+                        "promoted_at": "2025-02-04T00:53:41.637320",
                     }
                 }
             },
@@ -388,7 +404,7 @@ def promote_model(
         EnvironmentEnum.staging.value: 2,
         EnvironmentEnum.production.value: 3,
     }
-    # Use the updated "environment" property from the registry
+
     if promotion_order.get(environment, 0) <= promotion_order.get(
         entry.environment, 0
     ):
@@ -449,10 +465,9 @@ def promote_model(
 def predict(request_data: PredictRequest, db: Session = Depends(get_db)):
     dataset_name = request_data.dataset_name
     environment = request_data.environment.lower()
-    input_features = request_data.features  # List of dictionaries
-    version = request_data.version  # Optional: Specify version
+    input_features = request_data.features
+    version = request_data.version
 
-    # Load dataset entry from DB
     dataset_entry = (
         db.query(models.DatasetCatalog)
         .filter(models.DatasetCatalog.name == dataset_name)
@@ -461,7 +476,6 @@ def predict(request_data: PredictRequest, db: Session = Depends(get_db)):
     if not dataset_entry:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    # Query model registry for the specific version (if provided) or latest
     query = db.query(models.ModelRegistry).filter(
         models.ModelRegistry.dataset_id == dataset_entry.id,
         models.ModelRegistry.environment == environment,
@@ -479,7 +493,6 @@ def predict(request_data: PredictRequest, db: Session = Depends(get_db)):
             detail="No model found for the given environment and version",
         )
 
-    # Load model from object storage
     try:
         model_response = get_object_from_bucket(
             TRAINED_MODELS_BUCKET, entry.artifact_path
@@ -489,13 +502,10 @@ def predict(request_data: PredictRequest, db: Session = Depends(get_db)):
         logger.error(f"Failed to load model: {e}")
         raise HTTPException(status_code=500, detail="Failed to load model")
 
-    # Load feature names from the model registry
     feature_names = json.loads(entry.feature_names)
 
-    # Convert input features to DataFrame
     input_df = pd.DataFrame(input_features)
 
-    # Ensure all required features are present
     missing_features = set(feature_names) - set(input_df.columns)
     if missing_features:
         raise HTTPException(
@@ -503,7 +513,6 @@ def predict(request_data: PredictRequest, db: Session = Depends(get_db)):
             detail=f"Missing features in input: {missing_features}",
         )
 
-    # Ensure no extra features are provided
     extra_features = set(input_df.columns) - set(feature_names)
     if extra_features:
         raise HTTPException(
@@ -511,17 +520,12 @@ def predict(request_data: PredictRequest, db: Session = Depends(get_db)):
             detail=f"Extra features provided: {extra_features}",
         )
 
-    # Reorder columns to match training data
     input_df = input_df[feature_names]
 
-    # Ensure consistent data types
     for column in input_df.columns:
-        if (
-            input_df[column].dtype == object
-        ):  # Convert object (string) columns to categorical
+        if input_df[column].dtype == object:
             input_df[column] = input_df[column].astype("category")
 
-    # Get predictions
     try:
         predictions = model_pipeline.predict(input_df).tolist()
     except Exception as e:
@@ -553,26 +557,19 @@ def predict(request_data: PredictRequest, db: Session = Depends(get_db)):
                     "example": [
                         {
                             "id": 1,
-                            "name": "co2_emission_model_production_v1",
+                            "name": "iris_dataset_model_production_v1",
                             "version": 1,
                             "environment": "production",
-                            "dataset_name": "co2_emission",
+                            "dataset_name": "iris_dataset",
                             "features": [
-                                "Model_Year",
-                                "Make",
-                                "Model",
-                                "Vehicle_Class",
-                                "Engine_Size",
-                                "Cylinders",
-                                "Transmission",
-                                "Fuel_Consumption_in_City(L/100 km)",
-                                "Fuel_Consumption_in_City_Hwy(L/100 km)",
-                                "Fuel_Consumption_comb(L/100km)",
-                                "CO2_Emissions",
+                                "SepalLengthCm",
+                                "SepalWidthCm",
+                                "PetalLengthCm",
+                                "PetalWidthCm",
                             ],
-                            "trained_at": "2025-02-03T22:17:26",
-                            "promoted_at": "2025-02-03T22:18:05",
-                        },
+                            "trained_at": "2025-02-04T00:49:26",
+                            "promoted_at": "2025-02-04T00:53:41",
+                        }
                     ]
                 }
             },
@@ -629,26 +626,19 @@ def list_models(db: Session = Depends(get_db)):
                     "example": [
                         {
                             "id": 1,
-                            "name": "co2_emission_model_production_v1",
+                            "name": "iris_dataset_model_dev_v1",
                             "version": 1,
-                            "environment": "production",
-                            "dataset_name": "co2_emission",
+                            "environment": "dev",
+                            "dataset_name": "iris_dataset",
                             "features": [
-                                "Model_Year",
-                                "Make",
-                                "Model",
-                                "Vehicle_Class",
-                                "Engine_Size",
-                                "Cylinders",
-                                "Transmission",
-                                "Fuel_Consumption_in_City(L/100 km)",
-                                "Fuel_Consumption_in_City_Hwy(L/100 km)",
-                                "Fuel_Consumption_comb(L/100km)",
-                                "CO2_Emissions",
+                                "SepalLengthCm",
+                                "SepalWidthCm",
+                                "PetalLengthCm",
+                                "PetalWidthCm",
                             ],
-                            "trained_at": "2025-02-03T22:17:26",
-                            "promoted_at": "2025-02-03T22:18:05",
-                        },
+                            "trained_at": "2025-02-04T00:49:26",
+                            "promoted_at": "2025-02-04T00:49:26",
+                        }
                     ]
                 }
             },
@@ -656,7 +646,7 @@ def list_models(db: Session = Depends(get_db)):
     },
 )
 def list_models_by_dataset(
-    dataset_name: str = Query(..., example="co2_emission"),
+    dataset_name: str = Query(..., example="iris_dataset"),
     db: Session = Depends(get_db),
 ):
     dataset_entry = (
@@ -714,26 +704,19 @@ def list_models_by_dataset(
                 "application/json": {
                     "example": [
                         {
-                            "id": 2,
-                            "name": "co2_emission_model_staging_v2",
-                            "version": 2,
-                            "environment": "staging",
-                            "dataset_name": "co2_emission",
+                            "id": 1,
+                            "name": "iris_dataset_model_dev_v1",
+                            "version": 1,
+                            "environment": "dev",
+                            "dataset_name": "iris_dataset",
                             "features": [
-                                "Model_Year",
-                                "Make",
-                                "Model",
-                                "Vehicle_Class",
-                                "Engine_Size",
-                                "Cylinders",
-                                "Transmission",
-                                "Fuel_Consumption_in_City(L/100 km)",
-                                "Fuel_Consumption_in_City_Hwy(L/100 km)",
-                                "Fuel_Consumption_comb(L/100km)",
-                                "CO2_Emissions",
+                                "SepalLengthCm",
+                                "SepalWidthCm",
+                                "PetalLengthCm",
+                                "PetalWidthCm",
                             ],
-                            "trained_at": "2025-02-03T22:47:36",
-                            "promoted_at": "2025-02-03T22:51:05",
+                            "trained_at": "2025-02-04T00:49:26",
+                            "promoted_at": "2025-02-04T00:49:26",
                         }
                     ]
                 }
@@ -794,79 +777,60 @@ def list_models_by_environment(
                 "application/json": {
                     "example": {
                         "id": 1,
-                        "name": "co2_emission_model_dev_v1",
+                        "name": "iris_dataset_model_dev_v1",
                         "version": 1,
                         "environment": "dev",
-                        "dataset_name": "co2_emission",
-                        "artifact_path": "co2_emission_model_dev_v1.pkl",
+                        "dataset_name": "iris_dataset",
+                        "artifact_path": "iris_dataset_model_dev_v1.joblib",
                         "features": [
-                            "Model_Year",
-                            "Make",
-                            "Model",
-                            "Vehicle_Class",
-                            "Engine_Size",
-                            "Cylinders",
-                            "Transmission",
-                            "Fuel_Consumption_in_City(L/100 km)",
-                            "Fuel_Consumption_in_City_Hwy(L/100 km)",
-                            "Fuel_Consumption_comb(L/100km)",
-                            "CO2_Emissions",
+                            "SepalLengthCm",
+                            "SepalWidthCm",
+                            "PetalLengthCm",
+                            "PetalWidthCm",
                         ],
                         "metrics": {
-                            "accuracy": 0.5240641711229946,
-                            "precision": 0.6390650057529853,
-                            "recall": 0.5240641711229946,
-                            "f1_score": 0.4454557503075632,
+                            "accuracy": 1,
+                            "precision": 1,
+                            "recall": 1,
+                            "f1_score": 1,
                             "classification_report": {
-                                "1": {
+                                "Iris-setosa": {
                                     "precision": 1,
-                                    "recall": 0,
-                                    "f1-score": 0,
-                                    "support": 17,
+                                    "recall": 1,
+                                    "f1-score": 1,
+                                    "support": 10,
                                 },
-                                "3": {
-                                    "precision": 0.5416666666666666,
-                                    "recall": 0.3333333333333333,
-                                    "f1-score": 0.4126984126984127,
-                                    "support": 39,
-                                },
-                                "5": {
-                                    "precision": 0.48717948717948717,
-                                    "recall": 0.8507462686567164,
-                                    "f1-score": 0.6195652173913043,
-                                    "support": 67,
-                                },
-                                "6": {
+                                "Iris-versicolor": {
                                     "precision": 1,
-                                    "recall": 0,
-                                    "f1-score": 0,
-                                    "support": 25,
+                                    "recall": 1,
+                                    "f1-score": 1,
+                                    "support": 9,
                                 },
-                                "7": {
-                                    "precision": 0.6086956521739131,
-                                    "recall": 0.717948717948718,
-                                    "f1-score": 0.6588235294117647,
-                                    "support": 39,
+                                "Iris-virginica": {
+                                    "precision": 1,
+                                    "recall": 1,
+                                    "f1-score": 1,
+                                    "support": 11,
                                 },
-                                "accuracy": 0.5240641711229946,
+                                "accuracy": 1,
                                 "macro avg": {
-                                    "precision": 0.7275083612040134,
-                                    "recall": 0.3804056639877535,
-                                    "f1-score": 0.33821743190029635,
-                                    "support": 187,
+                                    "precision": 1,
+                                    "recall": 1,
+                                    "f1-score": 1,
+                                    "support": 30,
                                 },
                                 "weighted avg": {
-                                    "precision": 0.6390650057529853,
-                                    "recall": 0.5240641711229946,
-                                    "f1-score": 0.4454557503075632,
-                                    "support": 187,
+                                    "precision": 1,
+                                    "recall": 1,
+                                    "f1-score": 1,
+                                    "support": 30,
                                 },
                             },
                         },
                         "parameters": {"max_depth": 5, "n_estimators": 100},
                         "description": "Model trained automatically",
-                        "trained_at": "2025-02-03T22:17:26",
-                        "promoted_at": "2025-02-03T22:18:05",
+                        "trained_at": "2025-02-04T00:49:26",
+                        "promoted_at": "2025-02-04T00:49:26",
                     }
                 }
             },
@@ -894,7 +858,7 @@ def get_model_by_id(
         id=model.id,
         name=extract_model_name(model.artifact_path),
         version=model.version,
-        environment=model.environment,  # Updated property name
+        environment=model.environment,
         dataset_name=dataset_name,
         artifact_path=model.artifact_path,
         metrics=(
@@ -955,12 +919,13 @@ def get_model_by_id(
                 "application/json": {
                     "example": {
                         "message": (
-                            "Model version 2 removed successfully from staging"
+                            "Model version 1 removed successfully from "
+                            "production"
                         ),
-                        "dataset": "co2_emission",
-                        "version": 2,
-                        "environment": "staging",
-                        "removed_at": "2025-02-03T22:55:03.020978",
+                        "dataset": "iris_dataset",
+                        "version": 1,
+                        "environment": "production",
+                        "removed_at": "2025-02-04T00:48:49.409458",
                     }
                 }
             },
