@@ -1,3 +1,4 @@
+from datetime import datetime
 import logging
 from typing import List, Optional
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, File
@@ -166,6 +167,8 @@ def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
         .filter(models.ModelRegistry.dataset_id == dataset_id)
         .count()
     )
+
+    print(related_models_count)
     if related_models_count > 0:
         raise HTTPException(
             status_code=400,
@@ -175,8 +178,10 @@ def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
     db.delete(dataset)
     db.commit()
     logger.info(f"Dataset '{dataset.name}' has been deleted.")
-    return DeleteDatasetResponse(
+    response_data = DeleteDatasetResponse(
         message="Dataset deleted successfully",
         dataset=dataset.name,
-        deleted_at=dataset.created_at,
+        deleted_at=datetime.now(),
     )
+
+    return response_data.model_dump()
